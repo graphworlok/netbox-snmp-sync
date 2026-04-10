@@ -24,6 +24,10 @@ Query Cisco IOS, IOS-XE, IOS XR, NX-OS (Nexus), ASA, and Palo Alto PAN-OS device
 | Cisco NX-OS (Nexus) | `Cisco NX-OS` | yes | yes | Q-BRIDGE walk |
 | Cisco ASA | `Adaptive Security Appliance` | yes | yes | Q-BRIDGE walk |
 | Palo Alto PAN-OS | `Palo Alto Networks` | no | yes | Q-BRIDGE walk |
+| OpenWrt | `openwrt` in sysDescr | no | yes¹ | Q-BRIDGE walk¹ |
+| Generic Linux | sysDescr starts with `Linux` | no | yes¹ | Q-BRIDGE walk¹ |
+
+> ¹ Requires the relevant net-snmp module to be loaded on the device (`lldpd` for LLDP, `bridge_mib` for MAC table). Both are optional packages on OpenWrt and not enabled by default.
 
 ---
 
@@ -253,15 +257,71 @@ Both commands print colour-coded tables to the terminal using [Rich](https://ric
 
 ---
 
+## MAC address enrichment
+
+When configured, each entry in the `mac_table` JSON field gains one or more
+extra URL keys linking to the matching record in an external tool:
+
+```json
+[
+  {
+    "mac": "aa:bb:cc:dd:ee:ff",
+    "vlan": 10,
+    "type": "learned",
+    "lansweeper_url": "https://app.lansweeper.com/mysite/asset/12345",
+    "crowdstrike_url": "https://falcon.crowdstrike.com/host-management/hosts/abc123"
+  }
+]
+```
+
+URL keys are only added when a matching record is found — no match means no
+key, so existing consumers of the JSON are unaffected.
+
+### Built-in providers
+
+| Provider | Key added | Configured via |
+|---|---|---|
+| Lansweeper | `lansweeper_url` | `LANSWEEPER_API_URL` + `LANSWEEPER_TOKEN` |
+| CrowdStrike Falcon | `crowdstrike_url` | `CROWDSTRIKE_CLIENT_ID` + `CROWDSTRIKE_CLIENT_SECRET` |
+
+Leave the credential fields blank (the default) to disable a provider entirely.
+
+### Adding a custom provider
+
+Any object with a `name` (str) attribute and a `lookup_mac(mac) -> str | None`
+method qualifies as a provider.  Register it in `config.py`:
+
+```python
+from enrichment import BaseMacProvider
+
+class MyToolProvider(BaseMacProvider):
+    name = "mytool"
+
+    def __init__(self):
+        super().__init__()
+        # set up your HTTP session here
+
+    def _fetch(self, mac_norm: str):
+        # return a URL string, or None if not found
+        ...
+
+ENRICHMENT_PROVIDERS = [MyToolProvider()]
+```
+
+No changes to `sync.py` or any other file are required.
+
+---
+
 ## Project structure
 
 ```
 netbox-snmp-sync/
-├── config.py           Credentials, NetBox URL, discovery settings
+├── config.py           Credentials, NetBox URL, discovery settings, enrichment config
 ├── models.py           Dataclasses: DeviceInfo, Interface, Neighbor, MacTableEntry, …
 ├── snmp_collector.py   SNMP v2c/v3 walks: interfaces, IPs, CDP, LLDP, MAC table
 ├── discovery.py        BFS neighbour-driven device discovery engine
 ├── netbox_client.py    pynetbox wrapper: CRUD for devices, interfaces, IPs, cables, custom fields
+├── enrichment.py       MAC enrichment framework: MacLookupProvider protocol, built-in providers
 ├── sync.py             Drift detection + apply logic + cable/MAC sync passes
 ├── main.py             CLI (click): drift and sync commands
 └── requirements.txt

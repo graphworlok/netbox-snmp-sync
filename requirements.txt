@@ -2,3 +2,4 @@ pysnmp>=4.4.12
 pynetbox>=7.3.0
 click>=8.1
 rich>=13.0
+requests>=2.31

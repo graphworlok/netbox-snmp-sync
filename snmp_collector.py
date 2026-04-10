@@ -1,5 +1,5 @@
 """
-SNMP collection for Cisco IOS and ASA devices.
+SNMP collection for network devices.
 
 Supports:
   - SNMPv2c and SNMPv3 with automatic credential fallback
@@ -7,7 +7,11 @@ Supports:
   - Interfaces   (IF-MIB + ifXTable)
   - IPv4 addresses (IP-MIB)
   - LLDP neighbours (LLDP-MIB)
-  - CDP neighbours  (CISCO-CDP-MIB)
+  - CDP neighbours  (CISCO-CDP-MIB) — Cisco/UNKNOWN platforms only
+  - MAC address table (BRIDGE-MIB / Q-BRIDGE-MIB)
+
+Supported platforms: Cisco IOS, IOS-XE, IOS XR, NX-OS, ASA,
+                     Palo Alto PAN-OS, OpenWrt, generic Linux (net-snmp)
 """
 
 from __future__ import annotations
@@ -315,7 +319,8 @@ class SNMPCollector:
         info.interfaces = list(interfaces.values())
 
         info.neighbors = self._collect_lldp(interfaces)
-        # CDP is Cisco-proprietary; skip on PAN-OS and other non-Cisco platforms
+        # CDP is Cisco-proprietary; only attempt on Cisco platforms and UNKNOWN
+        # (OpenWrt and Linux devices never implement CDP)
         if info.platform in (Platform.IOS, Platform.IOSXR,
                              Platform.NXOS, Platform.ASA,
                              Platform.UNKNOWN):
@@ -699,6 +704,9 @@ def _detect_platform(sys_descr: str) -> Platform:
     NX-OS      : "Cisco NX-OS(tm) n9k, Software (n9k-dk9), Version 7.0(3)I7(9)"
     ASA        : "Cisco Adaptive Security Appliance Software Version 9.14(3)9"
     PAN-OS     : "Palo Alto Networks PA-3220 series firewall. SW Version: 10.1.3"
+    OpenWrt    : "Linux OpenWrt 5.15.137 #0 SMP ..."
+                 "OpenWrt Chaos Calmer 15.05 / LuCI ..."
+    Linux      : "Linux hostname 5.15.0-91-generic #101-Ubuntu SMP ..."
     """
     d = sys_descr.lower()
     if "palo alto" in d or "pan-os" in d:
@@ -711,6 +719,11 @@ def _detect_platform(sys_descr: str) -> Platform:
         return Platform.IOSXR
     if "cisco ios" in d:
         return Platform.IOS
+    # Check OpenWrt before generic Linux — OpenWrt sysDescr contains "linux"
+    if "openwrt" in d:
+        return Platform.OPENWRT
+    if d.startswith("linux ") or "\nlinux " in d:
+        return Platform.LINUX
     return Platform.UNKNOWN
 
 
@@ -722,14 +735,32 @@ def _parse_os_version(sys_descr: str, platform: Platform = Platform.UNKNOWN) -> 
     --------------------------
     IOS/IOS-XE/XR/ASA/NX-OS : "Version 15.2(4)M3" or "Version 9.14(3)9"
     PAN-OS                   : "SW Version: 10.1.3"  or "Version 10.1.3"
+    OpenWrt                  : "Linux OpenWrt 5.15.137 ..." → "5.15.137"
+                               "OpenWrt 23.05.2 / ..."     → "23.05.2"
+    Linux                    : "Linux hostname 5.15.0-91-generic ..." → "5.15.0-91-generic"
     """
     if platform == Platform.PANOS:
-        # PAN-OS reports "SW Version: X.Y.Z" in sysDescr
         match = re.search(r"SW\s+[Vv]ersion[:\s]+([\d\.]+)", sys_descr)
         if match:
             return match.group(1)
 
-    # Covers IOS, IOS-XR, NX-OS, ASA, and unknown Cisco gear
+    if platform == Platform.OPENWRT:
+        # "OpenWrt 23.05.2 / LuCI ..." — standalone release string
+        match = re.search(r"OpenWrt\s+([\d\.]+)", sys_descr, re.IGNORECASE)
+        if match:
+            return match.group(1)
+        # "Linux OpenWrt 5.15.137 #0 ..." — kernel version in field 3
+        match = re.search(r"Linux\s+\S+\s+([\d][\w\.\-]+)", sys_descr)
+        if match:
+            return match.group(1)
+
+    if platform == Platform.LINUX:
+        # "Linux <hostname> <kernel-version> ..."
+        match = re.search(r"Linux\s+\S+\s+([\d][\w\.\-]+)", sys_descr)
+        if match:
+            return match.group(1)
+
+    # Covers IOS, IOS-XR, NX-OS, ASA, and unknown gear
     match = re.search(r"[Vv]ersion\s+([\d\w\.\(\)]+)", sys_descr)
     return match.group(1) if match else ""
 

@@ -14,6 +14,7 @@ import logging
 from typing import Optional
 
 import config
+from enrichment import MacEnricher
 from models import (
     ChangeKind,
     DeviceInfo,
@@ -34,10 +35,17 @@ log = logging.getLogger(__name__)
 
 _MANUFACTURER = {"slug": "cisco",               "name": "Cisco"}
 _PALO_MFR     = {"slug": "palo-alto-networks",  "name": "Palo Alto Networks"}
+_GENERIC_MFR  = {"slug": "generic",             "name": "Generic"}
+
+_PLATFORM_MFR: dict[Platform, dict] = {
+    Platform.PANOS:   _PALO_MFR,
+    Platform.OPENWRT: _GENERIC_MFR,
+    Platform.LINUX:   _GENERIC_MFR,
+}
 
 
 def _manufacturer_for(platform: Platform) -> dict:
-    return _PALO_MFR if platform == Platform.PANOS else _MANUFACTURER
+    return _PLATFORM_MFR.get(platform, _MANUFACTURER)
 
 
 # ---------------------------------------------------------------------------
@@ -249,14 +257,16 @@ def sync_mac_table(
     Write per-interface MAC address tables into NetBox as a JSON custom field
     (mac_table) on dcim.interface.
 
-    Groups all MacTableEntry records by interface, then calls upsert_mac_table
-    for each interface that has at least one entry.
+    Groups all MacTableEntry records by interface, enriches each entry with
+    external-tool links (Lansweeper, CrowdStrike, …) when configured, then
+    calls upsert_mac_table for each interface that has at least one entry.
 
     The custom field is created automatically on first run if absent.
 
     Returns counts: {"updated": N, "unchanged": N, "skipped": N}.
     """
     nb.ensure_mac_table_custom_field()
+    enricher = MacEnricher.from_config()
 
     counts: dict[str, int] = {"updated": 0, "unchanged": 0, "skipped": 0}
 
@@ -289,6 +299,7 @@ def sync_mac_table(
                  device.display_name, len(by_iface))
 
         for if_name, entries in by_iface.items():
+            enricher.enrich(entries)   # adds *_url fields in place when configured
             if dry_run:
                 log.info("  [dry-run] %s/%s  %d MAC(s)",
                          device.display_name, if_name, len(entries))

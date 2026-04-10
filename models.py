@@ -13,6 +13,8 @@ class Platform(str, Enum):
     NXOS    = "nxos"      # Cisco NX-OS (Nexus)
     ASA     = "asa"       # Cisco ASA
     PANOS   = "panos"     # Palo Alto PAN-OS
+    OPENWRT = "openwrt"   # OpenWrt (Linux-based router/AP OS)
+    LINUX   = "linux"     # Generic Linux (net-snmp)
     UNKNOWN = "unknown"
 
 

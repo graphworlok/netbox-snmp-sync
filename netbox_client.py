@@ -30,6 +30,8 @@ _PLATFORM_SLUGS = {
     "nxos":    "cisco-nxos",
     "asa":     "cisco-asa",
     "panos":   "palo-alto-panos",
+    "openwrt": "openwrt",
+    "linux":   "linux",
     "unknown": "unknown",
 }
 
