@@ -416,7 +416,7 @@ def _device_payload(info: DeviceInfo, nb: NetBoxClient) -> dict:
     )
     platform = nb.get_or_create_platform(info.platform.value)
 
-    site = nb.get_or_create_site(config.DEFAULT_SITE_SLUG)
+    site = _resolve_site(info, nb)
     role = nb.get_or_create_device_role(config.DEFAULT_DEVICE_ROLE_SLUG)
 
     if site is None:
@@ -466,6 +466,43 @@ def _ip_payload(ip: IPAddress, iface_id: Optional[int]) -> dict:
         payload["assigned_object_type"] = "dcim.interface"
         payload["assigned_object_id"]   = iface_id
     return payload
+
+
+# ---------------------------------------------------------------------------
+# Site resolution
+# ---------------------------------------------------------------------------
+
+def _resolve_site(info: DeviceInfo, nb: NetBoxClient) -> Optional[object]:
+    """
+    Determine the NetBox site for a device using the following strategy:
+
+    1. Check every IP address collected from the device against NetBox IPAM
+       prefixes.  The most-specific prefix whose site field is set wins.
+       The device's own management IP (query_ip) is tried first, then each
+       interface IP in order.
+    2. Fall back to ``config.DEFAULT_SITE_SLUG`` if no IPAM match is found.
+
+    This means devices are automatically placed in the correct site when the
+    relevant IP space has already been allocated in NetBox, with no manual
+    configuration required.
+    """
+    # Collect IPs to probe: query IP first, then all interface IPs
+    candidate_ips: list[str] = [info.query_ip]
+    for iface in info.interfaces:
+        for ip_obj in iface.ip_addresses:
+            if ip_obj.address not in candidate_ips:
+                candidate_ips.append(ip_obj.address)
+
+    for ip in candidate_ips:
+        site = nb.site_for_ip(ip)
+        if site:
+            log.info("Site %r assigned to %s via IPAM (IP %s)",
+                     str(site), info.display_name, ip)
+            return site
+
+    log.debug("No IPAM site match for %s — using default %r",
+              info.display_name, config.DEFAULT_SITE_SLUG)
+    return nb.get_or_create_site(config.DEFAULT_SITE_SLUG)
 
 
 # ---------------------------------------------------------------------------

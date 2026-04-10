@@ -111,6 +111,31 @@ class NetBoxClient:
                 })
         return site
 
+    def site_for_ip(self, ip: str) -> Optional[object]:
+        """
+        Return the NetBox site associated with the most-specific IPAM prefix
+        that contains *ip*, or None if no matching prefix has a site.
+
+        Queries ``ipam.prefixes?contains=<ip>`` which returns all prefixes
+        that contain the address.  NetBox orders these from least- to
+        most-specific; we reverse the list to prefer the most-specific match.
+        """
+        try:
+            prefixes = list(self.nb.ipam.prefixes.filter(contains=ip))
+        except Exception as exc:
+            log.debug("IPAM prefix lookup failed for %s: %s", ip, exc)
+            return None
+
+        # Most-specific prefix first (longest prefix length wins)
+        prefixes.sort(key=lambda p: int(str(p.prefix).split("/")[1]), reverse=True)
+        for prefix in prefixes:
+            site = getattr(prefix, "site", None)
+            if site:
+                log.debug("Site %r found via IPAM prefix %s for IP %s",
+                          site, prefix.prefix, ip)
+                return site
+        return None
+
     def get_or_create_device_role(self, slug: str) -> Optional[object]:
         role = self.nb.dcim.device_roles.get(slug=slug)
         if not role:
