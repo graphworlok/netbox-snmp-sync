@@ -32,6 +32,7 @@ _PLATFORM_SLUGS = {
     "panos":   "palo-alto-panos",
     "openwrt": "openwrt",
     "linux":   "linux",
+    "meraki":  "meraki",
     "unknown": "unknown",
 }
 
@@ -205,31 +206,116 @@ class NetBoxClient:
             iface.update(payload)
 
     # ------------------------------------------------------------------
-    # Custom fields
+    # MAC addresses (native dcim.mac_addresses — NetBox 4.1+)
     # ------------------------------------------------------------------
 
-    _MAC_TABLE_FIELD = {
-        "name":         "mac_table",
-        "label":        "MAC Address Table",
-        "type":         "json",
-        "object_types": ["dcim.interface"],
-        "description":  (
-            "Bridge forwarding table entries learned on this interface. "
-            "Format: [{\"mac\": \"aa:bb:cc:dd:ee:ff\", \"vlan\": 10, \"type\": \"learned\"}, ...]"
-        ),
-    }
+    _STALE_TAG = {"name": "stale", "slug": "stale", "color": "9e9e9e"}
 
-    def ensure_mac_table_custom_field(self) -> None:
-        """Create the mac_table JSON custom field on dcim.interface if absent."""
-        existing = self.nb.extras.custom_fields.get(name="mac_table")
-        if existing:
-            return
-        log.info("Creating custom field: mac_table on dcim.interface")
-        if not self.dry_run:
-            try:
-                self.nb.extras.custom_fields.create(self._MAC_TABLE_FIELD)
-            except Exception as exc:
-                log.error("Could not create mac_table custom field: %s", exc)
+    _MAC_CUSTOM_FIELDS: list[dict] = [
+        {
+            "name":         "vendor",
+            "label":        "Vendor",
+            "type":         "text",
+            "object_types": ["dcim.macaddress"],
+            "description":  "IEEE OUI-derived organisation name for this MAC address.",
+            "required":     False,
+        },
+        {
+            "name":         "external_url",
+            "label":        "External URL",
+            "type":         "url",
+            "object_types": ["dcim.macaddress"],
+            "description":  "Link to this MAC address in an external asset management tool.",
+            "required":     False,
+        },
+    ]
+
+    def ensure_mac_address_fields(self) -> None:
+        """Create the 'stale' tag and MAC address custom fields if absent."""
+        if not self.nb.extras.tags.get(slug="stale"):
+            log.info("Creating tag: stale")
+            if not self.dry_run:
+                try:
+                    self.nb.extras.tags.create(self._STALE_TAG)
+                except Exception as exc:
+                    log.error("Could not create stale tag: %s", exc)
+
+        for field in self._MAC_CUSTOM_FIELDS:
+            if not self.nb.extras.custom_fields.get(name=field["name"]):
+                log.info("Creating custom field: %s on dcim.macaddress", field["name"])
+                if not self.dry_run:
+                    try:
+                        self.nb.extras.custom_fields.create(field)
+                    except Exception as exc:
+                        log.error("Could not create custom field %s: %s", field["name"], exc)
+
+    def sync_interface_macs(
+        self,
+        iface_id: int,
+        if_name: str,
+        snmp_macs: set[str],
+        vendor_map: Optional[dict[str, str]] = None,
+    ) -> dict[str, int]:
+        """
+        Reconcile SNMP-learned MACs against NetBox dcim.mac_addresses for one interface.
+
+        - Creates entries for MACs not yet in NetBox, populating the 'vendor'
+          custom field from *vendor_map* when available.
+        - Clears the 'stale' tag from MACs that are seen again.
+        - Applies the 'stale' tag to MACs present in NetBox but absent from the
+          current SNMP table.
+
+        Returns {"created": N, "refreshed": N, "stale": N, "unchanged": N}.
+        """
+        counts: dict[str, int] = {"created": 0, "refreshed": 0, "stale": 0, "unchanged": 0}
+        vendor_map = vendor_map or {}
+
+        existing = list(self.nb.dcim.mac_addresses.filter(
+            assigned_object_type="dcim.interface",
+            assigned_object_id=iface_id,
+        ))
+        existing_by_mac: dict[str, object] = {
+            str(obj.mac_address).lower(): obj for obj in existing
+        }
+
+        for mac in snmp_macs:
+            if mac in existing_by_mac:
+                obj = existing_by_mac[mac]
+                tag_slugs = [t.slug for t in (getattr(obj, "tags", None) or [])]
+                if "stale" in tag_slugs:
+                    log.info("REFRESH mac_address: %s on %s", mac, if_name)
+                    if not self.dry_run:
+                        obj.update({"tags": [{"slug": s} for s in tag_slugs if s != "stale"]})
+                    counts["refreshed"] += 1
+                else:
+                    counts["unchanged"] += 1
+            else:
+                vendor = vendor_map.get(mac, "")
+                log.info("CREATE mac_address: %s (%s) on interface id=%s (%s)",
+                         mac, vendor or "unknown vendor", iface_id, if_name)
+                if not self.dry_run:
+                    try:
+                        self.nb.dcim.mac_addresses.create({
+                            "mac_address":          mac,
+                            "assigned_object_type": "dcim.interface",
+                            "assigned_object_id":   iface_id,
+                            "custom_fields":        {"vendor": vendor},
+                        })
+                    except Exception as exc:
+                        log.error("Failed to create MAC %s on %s: %s", mac, if_name, exc)
+                        continue
+                counts["created"] += 1
+
+        for mac, obj in existing_by_mac.items():
+            if mac not in snmp_macs:
+                tag_slugs = [t.slug for t in (getattr(obj, "tags", None) or [])]
+                if "stale" not in tag_slugs:
+                    log.info("STALE mac_address: %s on %s", mac, if_name)
+                    if not self.dry_run:
+                        obj.update({"tags": [{"slug": s} for s in tag_slugs] + [{"slug": "stale"}]})
+                    counts["stale"] += 1
+
+        return counts
 
     # ------------------------------------------------------------------
     # IP addresses
@@ -252,30 +338,127 @@ class NetBoxClient:
         if ip_obj:
             ip_obj.update(payload)
 
-    def upsert_mac_table(
-        self,
-        device_id: int,
-        if_name: str,
-        entries: list[dict],   # [{"mac": str, "vlan": int, "type": str}, ...]
-    ) -> str:
-        """
-        Write the MAC table entry list to the mac_table JSON custom field on a
-        NetBox interface.  Returns "updated", "unchanged", or "skipped".
-        """
-        nb_iface = self.nb.dcim.interfaces.get(device_id=device_id, name=if_name)
-        if nb_iface is None:
-            log.debug("upsert_mac_table: interface %s not in NetBox", if_name)
-            return "skipped"
+    # ------------------------------------------------------------------
+    # Meraki
+    # ------------------------------------------------------------------
 
-        existing = (getattr(nb_iface, "custom_fields", {}) or {}).get("mac_table")
-        if existing == entries:
-            return "unchanged"
+    _MERAKI_NETWORK_FIELD = {
+        "name":         "meraki_network_id",
+        "label":        "Meraki Network ID",
+        "type":         "text",
+        "object_types": ["dcim.site"],
+        "description":  "Cisco Meraki Dashboard network ID (e.g. N_xxxxxxxxxxxx). "
+                        "Used by meraki_sync.py to associate a NetBox site with a "
+                        "Meraki network.",
+        "required":     False,
+    }
 
-        log.info("UPDATE mac_table: device_id=%s  if=%s  (%d entries)",
-                 device_id, if_name, len(entries))
-        if not self.dry_run:
-            nb_iface.update({"custom_fields": {"mac_table": entries}})
-        return "updated"
+    # ------------------------------------------------------------------
+    # CrowdStrike
+    # ------------------------------------------------------------------
+
+    _CS_TAG = {"name": "crowdstrike", "slug": "crowdstrike", "color": "e5001c"}
+
+    _CS_DEVICE_FIELDS: list[dict] = [
+        {
+            "name":         "crowdstrike_aid",
+            "label":        "CrowdStrike AID",
+            "type":         "text",
+            "object_types": ["dcim.device"],
+            "description":  "CrowdStrike Falcon agent ID (AID) for this device.",
+            "required":     False,
+        },
+        {
+            "name":         "last_public_ip",
+            "label":        "Last Public IP",
+            "type":         "text",
+            "object_types": ["dcim.device"],
+            "description":  "Last external/egress IP address this device was seen from "
+                            "(sourced from CrowdStrike external_ip).",
+            "required":     False,
+        },
+        {
+            "name":         "vulnerabilities",
+            "label":        "Vulnerabilities",
+            "type":         "json",
+            "object_types": ["dcim.device"],
+            "description":  "Vulnerability findings from CrowdStrike Spotlight. "
+                            "Includes CVEs and non-CVE misconfigurations. "
+                            'Format: {"updated": "...", "counts": {...}, "findings": [...]}',
+            "required":     False,
+        },
+    ]
+
+    def ensure_crowdstrike_device_fields(self) -> None:
+        """Create the crowdstrike tag and custom fields on dcim.device if absent."""
+        if not self.nb.extras.tags.get(slug="crowdstrike"):
+            log.info("Creating tag: crowdstrike")
+            if not self.dry_run:
+                try:
+                    self.nb.extras.tags.create(self._CS_TAG)
+                except Exception as exc:
+                    log.error("Could not create crowdstrike tag: %s", exc)
+
+        for field in self._CS_DEVICE_FIELDS:
+            if not self.nb.extras.custom_fields.get(name=field["name"]):
+                log.info("Creating custom field: %s on dcim.device", field["name"])
+                if not self.dry_run:
+                    try:
+                        self.nb.extras.custom_fields.create(field)
+                    except Exception as exc:
+                        log.error("Could not create custom field %s: %s", field["name"], exc)
+
+    def get_device_by_crowdstrike_aid(self, aid: str) -> Optional[object]:
+        """Return the NetBox device whose crowdstrike_aid custom field matches *aid*."""
+        try:
+            results = list(self.nb.dcim.devices.filter(**{"cf_crowdstrike_aid": aid}))
+            return results[0] if results else None
+        except Exception as exc:
+            log.debug("AID lookup failed for %s: %s", aid, exc)
+            return None
+
+    def get_device_by_mac(self, mac: str) -> Optional[object]:
+        """
+        Return the NetBox device that owns the given MAC address (colon-separated),
+        by looking up dcim.mac_addresses and following the assigned interface back
+        to its device.
+        """
+        try:
+            mac_obj = self.nb.dcim.mac_addresses.get(mac_address=mac)
+            if mac_obj:
+                assigned = getattr(mac_obj, "assigned_object", None)
+                if assigned and hasattr(assigned, "device"):
+                    return assigned.device
+        except Exception as exc:
+            log.debug("MAC device lookup failed for %s: %s", mac, exc)
+        return None
+
+    def ensure_meraki_network_field(self) -> None:
+        """Create the meraki_network_id custom field on dcim.site if absent."""
+        if not self.nb.extras.custom_fields.get(name="meraki_network_id"):
+            log.info("Creating custom field: meraki_network_id on dcim.site")
+            if not self.dry_run:
+                try:
+                    self.nb.extras.custom_fields.create(self._MERAKI_NETWORK_FIELD)
+                except Exception as exc:
+                    log.error("Could not create meraki_network_id custom field: %s", exc)
+
+    def get_sites_by_meraki_network(self) -> dict[str, object]:
+        """
+        Return a mapping of Meraki network ID → NetBox site object for every
+        site that has the meraki_network_id custom field populated.
+        """
+        result: dict[str, object] = {}
+        try:
+            sites = list(self.nb.dcim.sites.filter(**{"cf_meraki_network_id__n": ""}))
+        except Exception as exc:
+            log.error("Failed to query sites with meraki_network_id: %s", exc)
+            return result
+        for site in sites:
+            network_id = (getattr(site, "custom_fields", {}) or {}).get("meraki_network_id", "")
+            if network_id:
+                result[network_id] = site
+        return result
 
     # ------------------------------------------------------------------
     # Cables

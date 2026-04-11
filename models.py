@@ -15,6 +15,7 @@ class Platform(str, Enum):
     PANOS   = "panos"     # Palo Alto PAN-OS
     OPENWRT = "openwrt"   # OpenWrt (Linux-based router/AP OS)
     LINUX   = "linux"     # Generic Linux (net-snmp)
+    MERAKI  = "meraki"    # Cisco Meraki (Dashboard API)
     UNKNOWN = "unknown"
 
 
@@ -104,6 +105,7 @@ class DeviceInfo:
     interfaces: list[Interface] = field(default_factory=list)
     neighbors: list[Neighbor] = field(default_factory=list)
     mac_table: list[MacTableEntry] = field(default_factory=list)
+    site_id: Optional[int] = None  # override IPAM site resolution when set
 
     @property
     def display_name(self) -> str:

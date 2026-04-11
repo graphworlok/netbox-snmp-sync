@@ -72,30 +72,19 @@ CISCO_MANUFACTURER_SLUG = "cisco"
 DEFAULT_SITE_SLUG = "default"          # e.g. "london-dc1"
 DEFAULT_DEVICE_ROLE_SLUG = "network"   # e.g. "router", "switch", "firewall"
 
-# ---------------------------------------------------------------------------
-# MAC address enrichment (optional)
-# ---------------------------------------------------------------------------
-# When configured, each MAC entry written to the mac_table custom field gains
-# a "lansweeper_url" and/or "crowdstrike_url" key linking to the matching
-# record in the respective tool.  Leave API credentials blank to disable.
+# Device role slugs used when importing endpoints from CrowdStrike.
+# The roles are created automatically if they do not already exist.
+CS_WORKSTATION_ROLE_SLUG = "workstation"
+CS_SERVER_ROLE_SLUG      = "server"
 
-# --- Lansweeper ---
-# Cloud (hosted):
-#   LANSWEEPER_API_URL    = "https://api.lansweeper.com/api/integrations/graphql"
-#   LANSWEEPER_SITE_ID    = "<your-site-GUID>"
-#   LANSWEEPER_CONSOLE_URL = "https://app.lansweeper.com/<your-site-name>"
-# On-premises:
-#   LANSWEEPER_API_URL    = "https://<lansweeper-server>/api"
-#   LANSWEEPER_SITE_ID    = ""          (leave blank)
-#   LANSWEEPER_CONSOLE_URL = "https://<lansweeper-server>"
-LANSWEEPER_API_URL    = ""   # Leave blank to disable Lansweeper enrichment
-LANSWEEPER_TOKEN      = ""   # Personal access token from Lansweeper settings
-LANSWEEPER_SITE_ID    = ""   # Cloud only: site GUID shown in Settings → API
-LANSWEEPER_CONSOLE_URL = ""  # Base URL of the Lansweeper web UI
-
-# --- CrowdStrike Falcon ---
-# GovCloud customers: change *_URL values to the GovCloud hostnames.
-CROWDSTRIKE_CLIENT_ID     = ""   # Leave blank to disable CrowdStrike enrichment
-CROWDSTRIKE_CLIENT_SECRET = ""
-CROWDSTRIKE_API_URL       = "https://api.crowdstrike.com"
-CROWDSTRIKE_CONSOLE_URL   = "https://falcon.crowdstrike.com"
+# ---------------------------------------------------------------------------
+# IEEE OUI vendor lookup (optional)
+# ---------------------------------------------------------------------------
+# Path to a local copy of the IEEE OUI assignment CSV.  Download from:
+#   https://standards-oui.ieee.org/oui/oui.csv   (MA-L, ~37 k entries)
+#   https://standards-oui.ieee.org/oui28/mam.csv  (MA-M)
+#   https://standards-oui.ieee.org/oui36/oui36.csv (MA-S)
+#
+# A single path string or a list of paths (all files are merged).
+# Leave blank to disable vendor resolution; the 'vendor' field will be empty.
+OUI_FILE = ""   # e.g. "/opt/oui/oui.csv" or ["oui.csv", "mam.csv", "oui36.csv"]

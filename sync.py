@@ -14,7 +14,7 @@ import logging
 from typing import Optional
 
 import config
-from enrichment import MacEnricher
+from oui import OuiLookup
 from models import (
     ChangeKind,
     DeviceInfo,
@@ -254,21 +254,24 @@ def sync_mac_table(
     dry_run: bool = False,
 ) -> dict[str, int]:
     """
-    Write per-interface MAC address tables into NetBox as a JSON custom field
-    (mac_table) on dcim.interface.
+    Sync per-interface MAC address tables to native NetBox dcim.mac_addresses objects.
 
-    Groups all MacTableEntry records by interface, enriches each entry with
-    external-tool links (Lansweeper, CrowdStrike, …) when configured, then
-    calls upsert_mac_table for each interface that has at least one entry.
+    For each interface with learned MACs:
+    - Creates new MAC address objects, populating the 'vendor' custom field via
+      IEEE OUI lookup (requires OUI_FILE in config.py).
+    - Clears the 'stale' tag from MACs that are seen again.
+    - Tags MACs no longer present as 'stale'.
 
-    The custom field is created automatically on first run if absent.
+    The 'stale' tag and MAC custom fields are created automatically on first run.
 
-    Returns counts: {"updated": N, "unchanged": N, "skipped": N}.
+    Returns totals: {"created": N, "refreshed": N, "stale": N, "unchanged": N, "skipped": N}.
     """
-    nb.ensure_mac_table_custom_field()
-    enricher = MacEnricher.from_config()
+    nb.ensure_mac_address_fields()
+    oui = OuiLookup.from_config()
 
-    counts: dict[str, int] = {"updated": 0, "unchanged": 0, "skipped": 0}
+    totals: dict[str, int] = {
+        "created": 0, "refreshed": 0, "stale": 0, "unchanged": 0, "skipped": 0,
+    }
 
     for device in devices:
         if not device.mac_table:
@@ -279,41 +282,45 @@ def sync_mac_table(
             or nb.get_device_by_ip(device.query_ip)
         )
         if nb_device is None:
-            log.debug("MAC table sync: device %s not in NetBox yet",
-                      device.display_name)
-            counts["skipped"] += len(device.mac_table)
+            log.debug("MAC table sync: device %s not in NetBox yet", device.display_name)
+            totals["skipped"] += len(device.mac_table)
             continue
 
-        # Group entries by interface name
-        by_iface: dict[str, list[dict]] = {}
+        # Group MACs by interface, building a vendor map at the same time
+        by_iface: dict[str, set[str]] = {}
+        vendor_map: dict[str, str] = {}
         for entry in device.mac_table:
             if not entry.if_name:
                 continue
-            by_iface.setdefault(entry.if_name, []).append({
-                "mac":  entry.mac_address,
-                "vlan": entry.vlan,
-                "type": entry.entry_type.value,
-            })
+            by_iface.setdefault(entry.if_name, set()).add(entry.mac_address)
+            if entry.mac_address not in vendor_map:
+                vendor_map[entry.mac_address] = oui.lookup(entry.mac_address)
 
-        log.info("MAC table sync: %s  %d interface(s)",
-                 device.display_name, len(by_iface))
+        log.info("MAC table sync: %s  %d interface(s)", device.display_name, len(by_iface))
 
-        for if_name, entries in by_iface.items():
-            enricher.enrich(entries)   # adds *_url fields in place when configured
+        for if_name, macs in by_iface.items():
+            nb_iface = nb.get_interface(nb_device.id, if_name)
+            if nb_iface is None:
+                log.debug("MAC table sync: interface %s/%s not in NetBox",
+                          device.display_name, if_name)
+                totals["skipped"] += len(macs)
+                continue
+
             if dry_run:
                 log.info("  [dry-run] %s/%s  %d MAC(s)",
-                         device.display_name, if_name, len(entries))
-                counts["updated"] += 1
+                         device.display_name, if_name, len(macs))
+                totals["created"] += len(macs)
                 continue
-            try:
-                action = nb.upsert_mac_table(nb_device.id, if_name, entries)
-                counts[action] += 1
-            except Exception as exc:
-                log.error("MAC table upsert failed %s/%s: %s",
-                          device.display_name, if_name, exc)
-                counts["skipped"] += 1
 
-    return counts
+            try:
+                counts = nb.sync_interface_macs(nb_iface.id, if_name, macs, vendor_map)
+                for k, v in counts.items():
+                    totals[k] += v
+            except Exception as exc:
+                log.error("MAC sync failed %s/%s: %s", device.display_name, if_name, exc)
+                totals["skipped"] += len(macs)
+
+    return totals
 
 
 def sync_cables(
