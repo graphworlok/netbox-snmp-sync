@@ -78,6 +78,14 @@ CS_WORKSTATION_ROLE_SLUG = "workstation"
 CS_SERVER_ROLE_SLUG      = "server"
 
 # ---------------------------------------------------------------------------
+# Cisco Meraki (optional)
+# ---------------------------------------------------------------------------
+# Dashboard API key — generate in Meraki Dashboard under
+# Organisation → Settings → Dashboard API access.
+# Used by meraki_sync.py.  Leave blank if not using Meraki.
+MERAKI_API_KEY = ""
+
+# ---------------------------------------------------------------------------
 # IEEE OUI vendor lookup (optional)
 # ---------------------------------------------------------------------------
 # Path to a local copy of the IEEE OUI assignment CSV.  Download from:

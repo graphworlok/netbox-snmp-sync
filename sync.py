@@ -483,16 +483,20 @@ def _resolve_site(info: DeviceInfo, nb: NetBoxClient) -> Optional[object]:
     """
     Determine the NetBox site for a device using the following strategy:
 
+    0. Use ``info.site_id`` directly when set (e.g. supplied by Meraki sync).
     1. Check every IP address collected from the device against NetBox IPAM
        prefixes.  The most-specific prefix whose site field is set wins.
        The device's own management IP (query_ip) is tried first, then each
        interface IP in order.
     2. Fall back to ``config.DEFAULT_SITE_SLUG`` if no IPAM match is found.
-
-    This means devices are automatically placed in the correct site when the
-    relevant IP space has already been allocated in NetBox, with no manual
-    configuration required.
     """
+    if info.site_id is not None:
+        site = nb.nb.dcim.sites.get(info.site_id)
+        if site:
+            log.info("Site %r assigned to %s via site_id override",
+                     str(site), info.display_name)
+            return site
+
     # Collect IPs to probe: query IP first, then all interface IPs
     candidate_ips: list[str] = [info.query_ip]
     for iface in info.interfaces:
