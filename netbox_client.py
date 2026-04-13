@@ -238,6 +238,22 @@ class NetBoxClient:
     def get_interface(self, device_id: int, name: str) -> Optional[object]:
         return self.nb.dcim.interfaces.get(device_id=device_id, name=name)
 
+    def get_interface_any_name(self, device_id: int, name: str,
+                               variants_fn) -> Optional[object]:
+        """
+        Try each name variant returned by *variants_fn(name)* in order.
+        Returns the first match, or None.  The variants_fn is passed in to
+        avoid a circular import between netbox_client and sync.
+        """
+        for candidate in variants_fn(name):
+            iface = self.nb.dcim.interfaces.get(device_id=device_id, name=candidate)
+            if iface:
+                if candidate != name:
+                    log.debug("Interface %r matched as %r on device id=%s",
+                              name, candidate, device_id)
+                return iface
+        return None
+
     def create_interface(self, payload: dict) -> Optional[object]:
         log.info("CREATE interface: %s on device %s",
                  payload.get("name"), payload.get("device"))

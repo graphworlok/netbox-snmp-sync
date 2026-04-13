@@ -173,7 +173,7 @@ def drift_device(info: DeviceInfo, nb: NetBoxClient) -> DriftReport:
     nb_ifaces = {i.name: i for i in nb.get_interfaces(nb_device.id)}
 
     for iface in info.interfaces:
-        nb_iface = nb_ifaces.get(iface.name)
+        nb_iface = next((nb_ifaces[v] for v in _iface_name_variants(iface.name) if v in nb_ifaces), None)
         if nb_iface is None:
             report.items.append(DriftItem(
                 kind=ChangeKind.CREATE,
@@ -363,7 +363,7 @@ def _build_stack_drift(info: DeviceInfo, nb: NetBoxClient, report: DriftReport) 
         nb_ifaces = {i.name: i for i in nb.get_interfaces(nb_dev.id)} if nb_dev else {}
 
         for iface in member_ifaces.get(member.member_number, []):
-            nb_iface = nb_ifaces.get(iface.name)
+            nb_iface = next((nb_ifaces[v] for v in _iface_name_variants(iface.name) if v in nb_ifaces), None)
             if nb_iface is None:
                 payload = _interface_payload(
                     iface, device_id=nb_dev.id if nb_dev else None
@@ -513,7 +513,7 @@ def apply_report(
                 else:
                     iface_name = item.identifier.split(" / ", 1)[-1]
                     if target_device_id:
-                        nb_iface = nb.get_interface(target_device_id, iface_name)
+                        nb_iface = nb.get_interface_any_name(target_device_id, iface_name, _iface_name_variants)
                         if nb_iface:
                             nb.update_interface(nb_iface.id, item.payload)
 
@@ -607,7 +607,7 @@ def sync_mac_table(
                 totals["skipped"] += len(macs)
                 continue
 
-            nb_iface = nb.get_interface(nb_dev.id, if_name)
+            nb_iface = nb.get_interface_any_name(nb_dev.id, if_name, _iface_name_variants)
             if nb_iface is None:
                 log.debug("MAC table sync: interface %s/%s not in NetBox",
                           device.display_name, if_name)
@@ -666,7 +666,7 @@ def sync_cables(
                           device.display_name, nbr.local_if_name)
                 continue
 
-            local_nb_iface = nb.get_interface(local_nb_dev.id, nbr.local_if_name)
+            local_nb_iface = nb.get_interface_any_name(local_nb_dev.id, nbr.local_if_name, _iface_name_variants)
             if local_nb_iface is None:
                 log.debug("Cable sync: local iface %s/%s not in NetBox",
                           device.display_name, nbr.local_if_name)
@@ -845,7 +845,7 @@ def _resolve_remote_iface(remote_device: object, port_name: str, nb: NetBoxClien
     (e.g. the interface actually belongs to a stack member), also try searching
     by VC membership.
     """
-    iface = nb.get_interface(remote_device.id, port_name)  # type: ignore[attr-defined]
+    iface = nb.get_interface_any_name(remote_device.id, port_name, _iface_name_variants)  # type: ignore[attr-defined]
     if iface:
         return iface
 
@@ -860,7 +860,7 @@ def _resolve_remote_iface(remote_device: object, port_name: str, nb: NetBoxClien
         members = list(nb.nb.dcim.devices.filter(virtual_chassis_id=vc.id))
         for member in members:
             if getattr(member, "vc_position", None) == member_num:
-                return nb.get_interface(member.id, port_name)
+                return nb.get_interface_any_name(member.id, port_name, _iface_name_variants)
     except Exception as exc:
         log.debug("Remote iface VC member search failed: %s", exc)
     return None
@@ -975,6 +975,41 @@ def _resolve_site(info: DeviceInfo, nb: NetBoxClient) -> Optional[object]:
 def _short_hostname(hostname: str) -> str:
     """Return the first DNS label of *hostname* (everything before the first dot)."""
     return hostname.split(".")[0] if hostname else hostname
+
+
+# Mapping of Cisco abbreviated interface prefix → full name prefix
+_IFACE_ABBREV_TO_FULL = {
+    "Gi":   "GigabitEthernet",
+    "Te":   "TenGigabitEthernet",
+    "Tw":   "TwentyFiveGigE",
+    "Fo":   "FortyGigabitEthernet",
+    "Hu":   "HundredGigE",
+    "Fa":   "FastEthernet",
+    "Se":   "Serial",
+    "Lo":   "Loopback",
+    "Vl":   "Vlan",
+    "Po":   "Port-channel",
+    "Mg":   "MgmtEth",
+    "mgmt": "Management",
+}
+_IFACE_FULL_TO_ABBREV = {v: k for k, v in _IFACE_ABBREV_TO_FULL.items()}
+
+
+def _iface_name_variants(name: str) -> list[str]:
+    """
+    Return a list of alternate spellings for a Cisco interface name.
+
+    Cisco SNMP ifName returns abbreviated names (Gi1/0/1) while ifDescr
+    and some NetBox imports use the full form (GigabitEthernet1/0/1).
+    This returns [original, alternate] so callers can try both.
+    """
+    for abbrev, full in _IFACE_ABBREV_TO_FULL.items():
+        if name.startswith(abbrev) and not name.startswith(full):
+            return [name, full + name[len(abbrev):]]
+    for full, abbrev in _IFACE_FULL_TO_ABBREV.items():
+        if name.startswith(full):
+            return [name, abbrev + name[len(full):]]
+    return [name]
 
 
 def _check(
