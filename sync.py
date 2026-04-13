@@ -241,22 +241,25 @@ def _build_stack_drift(info: DeviceInfo, nb: NetBoxClient, report: DriftReport) 
     """
     short = _short_hostname(info.hostname)
 
-    # Check whether a virtual chassis already exists under the full or short name
-    log.debug("  VC lookup: checking for virtual chassis %r", info.hostname)
-    existing_vc = nb.get_virtual_chassis(info.hostname)
-    if existing_vc:
-        log.debug("  → virtual chassis %r already exists in NetBox (id=%s)",
-                  info.hostname, existing_vc.id)
-    else:
-        log.debug("  → virtual chassis %r not found in NetBox", info.hostname)
-        if short != info.hostname:
-            log.debug("  VC lookup: checking short name %r", short)
-            existing_vc = nb.get_virtual_chassis(short)
-            if existing_vc:
-                log.debug("  → virtual chassis %r already exists in NetBox (id=%s)",
-                          short, existing_vc.id)
-            else:
-                log.debug("  → virtual chassis %r not found in NetBox", short)
+    # Check whether a virtual chassis already exists — short name first
+    existing_vc = None
+    if short != info.hostname:
+        log.debug("  VC lookup: checking short name %r", short)
+        existing_vc = nb.get_virtual_chassis(short)
+        if existing_vc:
+            log.debug("  → virtual chassis %r already exists in NetBox (id=%s)",
+                      short, existing_vc.id)
+        else:
+            log.debug("  → virtual chassis %r not found in NetBox", short)
+
+    if existing_vc is None:
+        log.debug("  VC lookup: checking full hostname %r", info.hostname)
+        existing_vc = nb.get_virtual_chassis(info.hostname)
+        if existing_vc:
+            log.debug("  → virtual chassis %r already exists in NetBox (id=%s)",
+                      info.hostname, existing_vc.id)
+        else:
+            log.debug("  → virtual chassis %r not found in NetBox", info.hostname)
 
     if existing_vc is None:
         log.debug("  → virtual chassis will be created")
