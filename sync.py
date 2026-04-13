@@ -67,8 +67,22 @@ def drift_device(info: DeviceInfo, nb: NetBoxClient) -> DriftReport:
     """
     report = DriftReport(device_ip=info.query_ip, hostname=info.display_name)
 
+    log.debug(
+        "Lookup [%s]  serial=%r  hostname=%r  ip=%s",
+        info.display_name, info.serial_number or "(none)",
+        info.hostname, info.query_ip,
+    )
+
     # Stack: delegate to dedicated handler
     if info.stack_members:
+        log.debug(
+            "  → stack detected: %d member(s): %s",
+            len(info.stack_members),
+            ", ".join(
+                f"member {sm.member_number} serial={sm.serial_number!r} model={sm.model!r}"
+                for sm in info.stack_members
+            ),
+        )
         _build_stack_drift(info, nb, report)
         return report
 
@@ -76,11 +90,28 @@ def drift_device(info: DeviceInfo, nb: NetBoxClient) -> DriftReport:
     nb_device = None
     if info.serial_number:
         nb_device = nb.get_device_by_serial(info.serial_number)
+        if nb_device:
+            log.debug("  → matched by serial %r → NetBox id=%s name=%r",
+                      info.serial_number, nb_device.id, str(nb_device))
+        else:
+            log.debug("  → serial %r not found in NetBox", info.serial_number)
+    else:
+        log.debug("  → no serial number collected; skipping serial lookup")
+
     if nb_device is None:
-        nb_device = (
-            nb.get_device_by_name(info.hostname)
-            or nb.get_device_by_ip(info.query_ip)
-        )
+        nb_device = nb.get_device_by_name(info.hostname)
+        if nb_device:
+            log.debug("  → matched by hostname %r → NetBox id=%s", info.hostname, nb_device.id)
+        else:
+            log.debug("  → hostname %r not found in NetBox", info.hostname)
+
+    if nb_device is None:
+        nb_device = nb.get_device_by_ip(info.query_ip)
+        if nb_device:
+            log.debug("  → matched by IP %s → NetBox id=%s name=%r",
+                      info.query_ip, nb_device.id, str(nb_device))
+        else:
+            log.debug("  → IP %s not found in NetBox — device will be created", info.query_ip)
 
     if nb_device is None:
         report.items.append(DriftItem(
@@ -207,12 +238,32 @@ def _build_stack_drift(info: DeviceInfo, nb: NetBoxClient, report: DriftReport) 
     for member in sorted(info.stack_members, key=lambda sm: sm.member_number):
         member_name = f"{info.hostname}-{member.member_number}"
 
+        log.debug(
+            "  Stack member %d  name=%r  serial=%r  model=%r",
+            member.member_number, member_name,
+            member.serial_number or "(none)", member.model or "(none)",
+        )
+
         # Serial-first lookup, then by generated member name
         nb_dev = None
         if member.serial_number:
             nb_dev = nb.get_device_by_serial(member.serial_number)
+            if nb_dev:
+                log.debug("    → matched by serial %r → NetBox id=%s name=%r",
+                          member.serial_number, nb_dev.id, str(nb_dev))
+            else:
+                log.debug("    → serial %r not found in NetBox", member.serial_number)
+        else:
+            log.debug("    → no serial for member %d; skipping serial lookup",
+                      member.member_number)
+
         if nb_dev is None:
             nb_dev = nb.get_device_by_name(member_name)
+            if nb_dev:
+                log.debug("    → matched by name %r → NetBox id=%s", member_name, nb_dev.id)
+            else:
+                log.debug("    → name %r not found in NetBox — member will be created",
+                          member_name)
 
         if nb_dev is None:
             member_info = DeviceInfo(
