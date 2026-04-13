@@ -232,20 +232,49 @@ def _build_stack_drift(info: DeviceInfo, nb: NetBoxClient, report: DriftReport) 
     Populate *report* with drift items for a stacked (virtual chassis) device.
 
     Emits:
-      - One ``virtual_chassis`` item (get-or-create is idempotent in apply_report).
+      - One ``virtual_chassis`` item (CREATE if absent, skipped if already exists).
       - One ``device`` item per stack member, named <hostname>-<N>.
         Member lookup is serial-first, then by name.
       - ``interface`` items distributed to the correct member device by parsing
         the first digit group from the interface name (Gi2/0/1 → member 2).
       - ``ip_address`` items for any IPs not yet in NetBox.
     """
-    # Virtual chassis — always emitted so apply_report can resolve its ID
-    report.items.append(DriftItem(
-        kind=ChangeKind.CREATE,
-        object_type="virtual_chassis",
-        identifier=info.hostname,
-        payload={"name": info.hostname},
-    ))
+    short = _short_hostname(info.hostname)
+
+    # Check whether a virtual chassis already exists under the full or short name
+    log.debug("  VC lookup: checking for virtual chassis %r", info.hostname)
+    existing_vc = nb.get_virtual_chassis(info.hostname)
+    if existing_vc:
+        log.debug("  → virtual chassis %r already exists in NetBox (id=%s)",
+                  info.hostname, existing_vc.id)
+    else:
+        log.debug("  → virtual chassis %r not found in NetBox", info.hostname)
+        if short != info.hostname:
+            log.debug("  VC lookup: checking short name %r", short)
+            existing_vc = nb.get_virtual_chassis(short)
+            if existing_vc:
+                log.debug("  → virtual chassis %r already exists in NetBox (id=%s)",
+                          short, existing_vc.id)
+            else:
+                log.debug("  → virtual chassis %r not found in NetBox", short)
+
+    if existing_vc is None:
+        log.debug("  → virtual chassis will be created")
+        report.items.append(DriftItem(
+            kind=ChangeKind.CREATE,
+            object_type="virtual_chassis",
+            identifier=info.hostname,
+            payload={"name": info.hostname},
+        ))
+    else:
+        # VC exists — store its id in the report payload so apply_report can
+        # backfill it into member device payloads without a second lookup
+        report.items.append(DriftItem(
+            kind=ChangeKind.UPDATE,
+            object_type="virtual_chassis",
+            identifier=info.hostname,
+            payload={"id": existing_vc.id, "name": str(existing_vc)},
+        ))
 
     # Distribute interfaces to members by name; unresolvable → member 1
     member_ifaces: dict[int, list] = {}
@@ -408,9 +437,14 @@ def apply_report(
             continue
         try:
             if item.object_type == "virtual_chassis":
-                vc = nb.get_or_create_virtual_chassis(item.payload["name"])
-                if vc:
-                    vc_id = vc.id
+                if item.kind == ChangeKind.UPDATE:
+                    # VC already exists — id was stashed in payload by _build_stack_drift
+                    vc_id = item.payload["id"]
+                    log.debug("VC already exists (id=%s) — skipping create", vc_id)
+                else:
+                    vc = nb.get_or_create_virtual_chassis(item.payload["name"])
+                    vc_id = vc.id if vc else None
+                if vc_id:
                     # Backfill vc id into member device payloads queued after this item
                     for dev_item in items:
                         if (dev_item.object_type == "device"
