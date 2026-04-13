@@ -721,10 +721,11 @@ class NetBoxClient:
         ))
         for cable in cables:
             # Support both old (termination_a/b) and new (a_terminations list) API
+            # a_terminations items are pynetbox Records, not dicts — use getattr
             for term in getattr(cable, "a_terminations", []):
-                connected.add(term.get("object_id") or getattr(term, "id", None))
+                connected.add(getattr(term, "object_id", None) or getattr(term, "id", None))
             for term in getattr(cable, "b_terminations", []):
-                connected.add(term.get("object_id") or getattr(term, "id", None))
+                connected.add(getattr(term, "object_id", None) or getattr(term, "id", None))
             # Fallback for older NetBox
             ta = getattr(cable, "termination_a", None)
             tb = getattr(cable, "termination_b", None)
