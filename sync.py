@@ -875,12 +875,6 @@ def _device_payload(info: DeviceInfo, nb: NetBoxClient) -> dict:
     site = _resolve_site(info, nb)
     role = nb.get_or_create_device_role(config.DEFAULT_DEVICE_ROLE_SLUG)
 
-    if site is None:
-        raise RuntimeError(
-            f"Cannot create device: NetBox site {config.DEFAULT_SITE_SLUG!r} "
-            "does not exist and could not be created. "
-            "Set DEFAULT_SITE_SLUG in config.py to a valid site slug."
-        )
     if role is None:
         raise RuntimeError(
             f"Cannot create device: NetBox device role "
@@ -888,16 +882,18 @@ def _device_payload(info: DeviceInfo, nb: NetBoxClient) -> dict:
             "be created. Set DEFAULT_DEVICE_ROLE_SLUG in config.py."
         )
 
-    return {
+    payload: dict = {
         "name":        info.hostname or info.query_ip,
         "device_type": device_type.id if device_type else None,
         "role":        role.id,
-        "site":        site.id,
         "platform":    platform.id if platform else None,
         "serial":      info.serial_number,
         "status":      "active",
         "comments":    info.os_version,
     }
+    if site is not None:
+        payload["site"] = site.id
+    return payload
 
 
 def _interface_payload(iface: Interface, device_id: Optional[int]) -> dict:
@@ -930,14 +926,16 @@ def _ip_payload(ip: IPAddress, iface_id: Optional[int]) -> dict:
 
 def _resolve_site(info: DeviceInfo, nb: NetBoxClient) -> Optional[object]:
     """
-    Determine the NetBox site for a device using the following strategy:
+    Determine the NetBox site for a device by IPAM prefix lookup only.
 
     0. Use ``info.site_id`` directly when set (e.g. supplied by Meraki sync).
     1. Check every IP address collected from the device against NetBox IPAM
        prefixes.  The most-specific prefix whose site field is set wins.
        The device's own management IP (query_ip) is tried first, then each
        interface IP in order.
-    2. Fall back to ``config.DEFAULT_SITE_SLUG`` if no IPAM match is found.
+
+    Returns None if no site can be resolved — the caller will log a warning
+    and omit the site field rather than falling back to a default.
     """
     if info.site_id is not None:
         site = nb.nb.dcim.sites.get(info.site_id)
@@ -960,9 +958,9 @@ def _resolve_site(info: DeviceInfo, nb: NetBoxClient) -> Optional[object]:
                      str(site), info.display_name, ip)
             return site
 
-    log.debug("No IPAM site match for %s — using default %r",
-              info.display_name, config.DEFAULT_SITE_SLUG)
-    return nb.get_or_create_site(config.DEFAULT_SITE_SLUG)
+    log.warning("No IPAM site match for %s (IPs tried: %s) — site will be unset",
+                info.display_name, ", ".join(candidate_ips))
+    return None
 
 
 # ---------------------------------------------------------------------------
