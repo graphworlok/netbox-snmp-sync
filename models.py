@@ -93,6 +93,15 @@ class MacTableEntry:
 
 
 @dataclass
+class StackMember:
+    """One physical member of a Cisco StackWise / Catalyst stacked chassis."""
+    member_number: int      # 1-based stack position
+    model: str
+    serial_number: str
+    os_version: str = ""
+
+
+@dataclass
 class DeviceInfo:
     """Top-level information about a queried device."""
     query_ip: str
@@ -106,6 +115,7 @@ class DeviceInfo:
     neighbors: list[Neighbor] = field(default_factory=list)
     mac_table: list[MacTableEntry] = field(default_factory=list)
     site_id: Optional[int] = None  # override IPAM site resolution when set
+    stack_members: list[StackMember] = field(default_factory=list)
 
     @property
     def display_name(self) -> str:

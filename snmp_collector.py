@@ -55,6 +55,7 @@ from models import (
     Neighbor,
     OperStatus,
     Platform,
+    StackMember,
 )
 
 log = logging.getLogger(__name__)
@@ -341,20 +342,51 @@ class SNMPCollector:
         sw_revs  = self._walk(OID_ENT_PHYS_SW_REV)
         descs    = self._walk(OID_ENT_PHYS_DESCR)
 
-        # Prefer the chassis entry (class == 3); fall back to index "1"
+        # Find all chassis entries (entPhysicalClass == 3); fall back to index "1"
         chassis_indices = [idx for idx, cls in classes.items() if cls == "3"]
         if not chassis_indices:
             chassis_indices = ["1"]
 
-        for idx in chassis_indices:
-            model = models.get(idx, "").strip()
+        # Sort numerically for consistent member ordering (lower OID index = lower member)
+        chassis_indices.sort(key=lambda x: int(x) if x.isdigit() else 0)
+
+        if len(chassis_indices) == 1:
+            # Single device — original behaviour
+            idx = chassis_indices[0]
+            info.model = models.get(idx, "").strip()
+            info.serial_number = serials.get(idx, "").strip()
+            if not info.os_version:
+                info.os_version = sw_revs.get(idx, "").strip()
+            return
+
+        # Multiple chassis entries — stack detected; populate stack_members
+        for position, idx in enumerate(chassis_indices, start=1):
+            model  = models.get(idx, "").strip()
             serial = serials.get(idx, "").strip()
-            if model or serial:
-                info.model = model
-                info.serial_number = serial
-                if not info.os_version:
-                    info.os_version = sw_revs.get(idx, "").strip()
-                break
+            desc   = descs.get(idx, "").strip()
+            os_ver = sw_revs.get(idx, "").strip()
+
+            # Derive member number from entPhysicalDescr ("Switch 2") when present
+            m = re.search(r'[Ss]witch\s+(\d+)', desc)
+            member_num = int(m.group(1)) if m else position
+
+            info.stack_members.append(StackMember(
+                member_number=member_num,
+                model=model,
+                serial_number=serial,
+                os_version=os_ver,
+            ))
+
+        # Populate top-level DeviceInfo fields from the primary member (1)
+        # so the discovery summary table still shows meaningful data
+        primary = next(
+            (sm for sm in info.stack_members if sm.member_number == 1),
+            info.stack_members[0],
+        )
+        info.model = primary.model
+        info.serial_number = primary.serial_number
+        if not info.os_version:
+            info.os_version = primary.os_version
 
     # ------------------------------------------------------------------
     # Interfaces

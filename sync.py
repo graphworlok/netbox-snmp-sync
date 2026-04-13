@@ -11,6 +11,7 @@ sync_cables(devices, nb, ...)   -> int            (second pass: cables only)
 from __future__ import annotations
 
 import logging
+import re
 from typing import Optional
 
 import config
@@ -57,13 +58,29 @@ def drift_device(info: DeviceInfo, nb: NetBoxClient) -> DriftReport:
     Compare SNMP-collected DeviceInfo against the current NetBox state.
     Returns a DriftReport; does NOT write anything to NetBox.
     Cables are handled separately via sync_cables() after all devices exist.
+
+    For stacked switches (info.stack_members populated), delegates to
+    _build_stack_drift() which creates a virtual chassis and one device per
+    member named <hostname>-<N>.
+
+    Device lookup order: serial number → hostname → management IP.
     """
     report = DriftReport(device_ip=info.query_ip, hostname=info.display_name)
 
-    nb_device = (
-        nb.get_device_by_name(info.hostname)
-        or nb.get_device_by_ip(info.query_ip)
-    )
+    # Stack: delegate to dedicated handler
+    if info.stack_members:
+        _build_stack_drift(info, nb, report)
+        return report
+
+    # Non-stack: serial-first lookup, then hostname, then IP
+    nb_device = None
+    if info.serial_number:
+        nb_device = nb.get_device_by_serial(info.serial_number)
+    if nb_device is None:
+        nb_device = (
+            nb.get_device_by_name(info.hostname)
+            or nb.get_device_by_ip(info.query_ip)
+        )
 
     if nb_device is None:
         report.items.append(DriftItem(
@@ -142,6 +159,135 @@ def drift_device(info: DeviceInfo, nb: NetBoxClient) -> DriftReport:
     return report
 
 
+def _stack_member_from_iface_name(name: str) -> int:
+    """
+    Extract the stack member number from a Cisco interface name.
+
+    On Catalyst stacked switches the member number is the first digit group
+    in the interface name, e.g.:
+        GigabitEthernet2/0/1  → 2
+        TenGigabitEthernet3/1/1 → 3
+        Te1/0/24              → 1
+
+    Returns 0 for interfaces that don't follow this pattern (Vlan10,
+    Loopback0, mgmt0, etc.) — callers should default those to member 1.
+    """
+    m = re.match(r'[A-Za-z]+(\d+)/', name)
+    return int(m.group(1)) if m else 0
+
+
+def _build_stack_drift(info: DeviceInfo, nb: NetBoxClient, report: DriftReport) -> None:
+    """
+    Populate *report* with drift items for a stacked (virtual chassis) device.
+
+    Emits:
+      - One ``virtual_chassis`` item (get-or-create is idempotent in apply_report).
+      - One ``device`` item per stack member, named <hostname>-<N>.
+        Member lookup is serial-first, then by name.
+      - ``interface`` items distributed to the correct member device by parsing
+        the first digit group from the interface name (Gi2/0/1 → member 2).
+      - ``ip_address`` items for any IPs not yet in NetBox.
+    """
+    # Virtual chassis — always emitted so apply_report can resolve its ID
+    report.items.append(DriftItem(
+        kind=ChangeKind.CREATE,
+        object_type="virtual_chassis",
+        identifier=info.hostname,
+        payload={"name": info.hostname},
+    ))
+
+    # Distribute interfaces to members by name; unresolvable → member 1
+    member_ifaces: dict[int, list] = {}
+    for iface in info.interfaces:
+        member_num = _stack_member_from_iface_name(iface.name)
+        if member_num == 0:
+            member_num = 1
+        member_ifaces.setdefault(member_num, []).append(iface)
+
+    for member in sorted(info.stack_members, key=lambda sm: sm.member_number):
+        member_name = f"{info.hostname}-{member.member_number}"
+
+        # Serial-first lookup, then by generated member name
+        nb_dev = None
+        if member.serial_number:
+            nb_dev = nb.get_device_by_serial(member.serial_number)
+        if nb_dev is None:
+            nb_dev = nb.get_device_by_name(member_name)
+
+        if nb_dev is None:
+            member_info = DeviceInfo(
+                query_ip=info.query_ip,
+                hostname=member_name,
+                model=member.model,
+                serial_number=member.serial_number,
+                os_version=member.os_version,
+                platform=info.platform,
+                site_id=info.site_id,
+            )
+            payload = _device_payload(member_info, nb)
+            payload["vc_position"] = member.member_number
+            # virtual_chassis id is backfilled by apply_report after VC creation
+            report.items.append(DriftItem(
+                kind=ChangeKind.CREATE,
+                object_type="device",
+                identifier=member_name,
+                payload=payload,
+            ))
+        else:
+            diffs: list[FieldDiff] = []
+            _check(diffs, "serial", getattr(nb_dev, "serial", ""), member.serial_number)
+            _check(diffs, "comments", getattr(nb_dev, "comments", ""), member.os_version,
+                   label="os_version")
+            if diffs:
+                report.items.append(DriftItem(
+                    kind=ChangeKind.UPDATE,
+                    object_type="device",
+                    identifier=member_name,
+                    diffs=diffs,
+                    payload={d.field: d.snmp_value for d in diffs},
+                ))
+
+        nb_ifaces = {i.name: i for i in nb.get_interfaces(nb_dev.id)} if nb_dev else {}
+
+        for iface in member_ifaces.get(member.member_number, []):
+            nb_iface = nb_ifaces.get(iface.name)
+            if nb_iface is None:
+                payload = _interface_payload(
+                    iface, device_id=nb_dev.id if nb_dev else None
+                )
+                report.items.append(DriftItem(
+                    kind=ChangeKind.CREATE,
+                    object_type="interface",
+                    identifier=f"{member_name} / {iface.name}",
+                    payload=payload,
+                ))
+            else:
+                iface_diffs: list[FieldDiff] = []
+                _check(iface_diffs, "description",
+                       getattr(nb_iface, "description", ""), iface.description)
+                _check(iface_diffs, "mac_address",
+                       getattr(nb_iface, "mac_address", ""), iface.mac_address)
+                if iface_diffs:
+                    report.items.append(DriftItem(
+                        kind=ChangeKind.UPDATE,
+                        object_type="interface",
+                        identifier=f"{member_name} / {iface.name}",
+                        diffs=iface_diffs,
+                        payload={d.field: d.snmp_value for d in iface_diffs},
+                    ))
+
+            for ip in iface.ip_addresses:
+                if not nb.get_ip_address(ip.cidr):
+                    report.items.append(DriftItem(
+                        kind=ChangeKind.CREATE,
+                        object_type="ip_address",
+                        identifier=ip.cidr,
+                        payload=_ip_payload(
+                            ip, iface_id=nb_iface.id if nb_iface else None
+                        ),
+                    ))
+
+
 # ---------------------------------------------------------------------------
 # Apply device / interface / IP changes
 # ---------------------------------------------------------------------------
@@ -155,13 +301,22 @@ def apply_report(
     Push device, interface, and IP address changes from a DriftReport to NetBox.
     Returns the number of objects written.
 
+    For stacked devices the report will contain a ``virtual_chassis`` item
+    followed by per-member ``device`` items.  The VC id is resolved first and
+    backfilled into each member's payload before the device rows are processed.
+    Interfaces are routed to the correct member device using the device name
+    embedded in the item identifier (<device-name> / <iface-name>).
+
     Cable creation is intentionally excluded here — call sync_cables() once
     all devices in a run have been processed.
     """
     applied = 0
     device_id: Optional[int] = None
+    # Stack member name → NetBox device id; populated during device processing
+    member_device_ids: dict[str, int] = {}
+    vc_id: Optional[int] = None
 
-    order = {"device": 0, "interface": 1, "ip_address": 2}
+    order = {"virtual_chassis": 0, "device": 1, "interface": 2, "ip_address": 3}
     items = sorted(
         [i for i in report.items if i.object_type != "cable"],
         key=lambda i: order.get(i.object_type, 9),
@@ -171,37 +326,71 @@ def apply_report(
         if item.kind == ChangeKind.CREATE and not create_missing:
             continue
         try:
-            if item.object_type == "device":
+            if item.object_type == "virtual_chassis":
+                vc = nb.get_or_create_virtual_chassis(item.payload["name"])
+                if vc:
+                    vc_id = vc.id
+                    # Backfill vc id into member device payloads queued after this item
+                    for dev_item in items:
+                        if (dev_item.object_type == "device"
+                                and "vc_position" in dev_item.payload
+                                and not dev_item.payload.get("virtual_chassis")):
+                            dev_item.payload["virtual_chassis"] = vc_id
+
+            elif item.object_type == "device":
                 if item.kind == ChangeKind.CREATE:
                     result = nb.create_device(item.payload)
-                    device_id = result.id if result else None
+                    if result:
+                        if "vc_position" in item.payload:
+                            member_device_ids[item.identifier] = result.id
+                        else:
+                            device_id = result.id
                 else:
-                    _ensure_device_id(report, nb, lambda d: None)
-                    dev = nb.get_device_by_name(report.hostname) or \
-                          nb.get_device_by_ip(report.device_ip)
+                    dev = (
+                        nb.get_device_by_name(item.identifier)
+                        or nb.get_device_by_ip(report.device_ip)
+                    )
                     if dev:
                         nb.update_device(dev.id, item.payload)
-                        device_id = dev.id
+                        if item.identifier != report.hostname:
+                            member_device_ids[item.identifier] = dev.id
+                        else:
+                            device_id = dev.id
 
             elif item.object_type == "interface":
-                if device_id is None:
-                    dev = nb.get_device_by_name(report.hostname) or \
-                          nb.get_device_by_ip(report.device_ip)
-                    device_id = dev.id if dev else None
+                # Determine which device owns this interface from the identifier
+                iface_device_name = item.identifier.split(" / ", 1)[0]
+
+                if iface_device_name in member_device_ids:
+                    target_device_id = member_device_ids[iface_device_name]
+                elif member_device_ids or iface_device_name != report.hostname:
+                    # Stack run — member device may already exist in NetBox
+                    dev = nb.get_device_by_name(iface_device_name)
+                    target_device_id = dev.id if dev else None
+                    if target_device_id:
+                        member_device_ids[iface_device_name] = target_device_id
+                else:
+                    # Non-stack: resolve the single device id
+                    if device_id is None:
+                        dev = (
+                            nb.get_device_by_name(report.hostname)
+                            or nb.get_device_by_ip(report.device_ip)
+                        )
+                        device_id = dev.id if dev else None
+                    target_device_id = device_id
 
                 if item.kind == ChangeKind.CREATE:
-                    if device_id and item.payload.get("device") is None:
-                        item.payload["device"] = device_id
+                    if target_device_id and item.payload.get("device") is None:
+                        item.payload["device"] = target_device_id
                     created_iface = nb.create_interface(item.payload)
-                    # Patch any IP payloads that were waiting on this iface ID
                     if created_iface:
                         iface_name = item.payload.get("name", "")
                         _backfill_iface_id(items, iface_name, created_iface.id,
-                                           report.hostname)
+                                           iface_device_name)
                 else:
                     iface_name = item.identifier.split(" / ", 1)[-1]
-                    if device_id:
-                        nb_iface = nb.get_interface(device_id, iface_name)
+                    if target_device_id:
+                        nb_iface = nb.get_interface(target_device_id, iface_name)
                         if nb_iface:
                             nb.update_interface(nb_iface.id, item.payload)
 
@@ -238,10 +427,6 @@ def _backfill_iface_id(
                 if item.payload.get("assigned_object_id") is None:
                     item.payload["assigned_object_type"] = "dcim.interface"
                     item.payload["assigned_object_id"] = iface_id
-
-
-def _ensure_device_id(report, nb, _):
-    pass  # placeholder kept for symmetry
 
 
 # ---------------------------------------------------------------------------

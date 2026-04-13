@@ -153,6 +153,16 @@ class NetBoxClient:
     # Devices
     # ------------------------------------------------------------------
 
+    def get_device_by_serial(self, serial: str) -> Optional[object]:
+        if not serial:
+            return None
+        try:
+            results = list(self.nb.dcim.devices.filter(serial=serial))
+            return results[0] if results else None
+        except Exception as exc:
+            log.debug("Serial lookup failed for %s: %s", serial, exc)
+            return None
+
     def get_device_by_name(self, name: str) -> Optional[object]:
         return self.nb.dcim.devices.get(name=name)
 
@@ -165,6 +175,21 @@ class NetBoxClient:
             if hasattr(ao, "device"):
                 return ao.device
         return None
+
+    # ------------------------------------------------------------------
+    # Virtual chassis
+    # ------------------------------------------------------------------
+
+    def get_virtual_chassis(self, name: str) -> Optional[object]:
+        return self.nb.dcim.virtual_chassis.get(name=name)
+
+    def get_or_create_virtual_chassis(self, name: str) -> Optional[object]:
+        vc = self.get_virtual_chassis(name)
+        if not vc:
+            log.info("Creating virtual chassis: %s", name)
+            if not self.dry_run:
+                vc = self.nb.dcim.virtual_chassis.create({"name": name})
+        return vc
 
     def create_device(self, payload: dict) -> Optional[object]:
         log.info("CREATE device: %s", payload.get("name"))
@@ -389,8 +414,126 @@ class NetBoxClient:
         },
     ]
 
+    # Extended fields populated only by cs_sync.py
+    _CS_DEVICE_FIELDS_EXTENDED: list[dict] = [
+        {
+            "name":         "cs_falcon_url",
+            "label":        "CS Falcon URL",
+            "type":         "url",
+            "object_types": ["dcim.device"],
+            "description":  "Direct link to this device in the CrowdStrike Falcon console.",
+            "required":     False,
+        },
+        {
+            "name":         "cs_first_seen",
+            "label":        "CS First Seen",
+            "type":         "text",
+            "object_types": ["dcim.device"],
+            "description":  "Timestamp when the CrowdStrike Falcon agent first enrolled "
+                            "on this device (ISO 8601, sourced from Falcon first_seen).",
+            "required":     False,
+        },
+        {
+            "name":         "cs_last_seen",
+            "label":        "CS Last Seen",
+            "type":         "text",
+            "object_types": ["dcim.device"],
+            "description":  "Timestamp of the last CrowdStrike Falcon agent check-in "
+                            "(ISO 8601, sourced from Falcon last_seen).",
+            "required":     False,
+        },
+        {
+            "name":         "cs_sensor_version",
+            "label":        "CS Sensor Version",
+            "type":         "text",
+            "object_types": ["dcim.device"],
+            "description":  "CrowdStrike Falcon sensor (agent) version installed on this device.",
+            "required":     False,
+        },
+        {
+            "name":         "cs_os_version",
+            "label":        "CS OS Version",
+            "type":         "text",
+            "object_types": ["dcim.device"],
+            "description":  "Detailed operating system version string from CrowdStrike Falcon.",
+            "required":     False,
+        },
+        {
+            "name":         "cs_containment_status",
+            "label":        "CS Containment Status",
+            "type":         "text",
+            "object_types": ["dcim.device"],
+            "description":  "CrowdStrike network containment state: normal, contained, "
+                            "containment_pending, or lift_containment_pending.",
+            "required":     False,
+        },
+        {
+            "name":         "cs_reduced_functionality",
+            "label":        "CS Reduced Functionality",
+            "type":         "boolean",
+            "object_types": ["dcim.device"],
+            "description":  "True if the CrowdStrike sensor is running in Reduced "
+                            "Functionality Mode (RFM) — sensor capability is degraded.",
+            "required":     False,
+        },
+        {
+            "name":         "cs_prevention_policy",
+            "label":        "CS Prevention Policy",
+            "type":         "text",
+            "object_types": ["dcim.device"],
+            "description":  "Name of the CrowdStrike prevention policy applied to this device.",
+            "required":     False,
+        },
+        {
+            "name":         "cs_groups",
+            "label":        "CS Host Groups",
+            "type":         "text",
+            "object_types": ["dcim.device"],
+            "description":  "Comma-separated list of CrowdStrike host group names "
+                            "this device belongs to.",
+            "required":     False,
+        },
+        {
+            "name":         "cs_chassis_type",
+            "label":        "CS Chassis Type",
+            "type":         "text",
+            "object_types": ["dcim.device"],
+            "description":  "Chassis type reported by CrowdStrike "
+                            "(e.g. Desktop, Laptop, Server, Virtual Machine).",
+            "required":     False,
+        },
+        {
+            "name":         "cs_zta_score",
+            "label":        "CS ZTA Score",
+            "type":         "integer",
+            "object_types": ["dcim.device"],
+            "description":  "CrowdStrike Zero Trust Assessment overall score (0–100). "
+                            "Higher is better. Requires ZTA to be licensed.",
+            "required":     False,
+        },
+        {
+            "name":         "cs_active_detections",
+            "label":        "CS Active Detections",
+            "type":         "integer",
+            "object_types": ["dcim.device"],
+            "description":  "Count of open or in-progress CrowdStrike Falcon detections "
+                            "for this device.",
+            "required":     False,
+        },
+        {
+            "name":         "cs_discover_id",
+            "label":        "CS Discover Asset ID",
+            "type":         "text",
+            "object_types": ["dcim.device"],
+            "description":  "CrowdStrike Discover asset ID for devices that do not run "
+                            "the Falcon sensor (unmanaged workstations, network gear). "
+                            "Mutually exclusive with crowdstrike_aid.",
+            "required":     False,
+        },
+    ]
+
     def ensure_crowdstrike_device_fields(self) -> None:
-        """Create the crowdstrike tag and custom fields on dcim.device if absent."""
+        """Create the crowdstrike tag and base custom fields on dcim.device if absent."""
         if not self.nb.extras.tags.get(slug="crowdstrike"):
             log.info("Creating tag: crowdstrike")
             if not self.dry_run:
@@ -400,6 +543,19 @@ class NetBoxClient:
                     log.error("Could not create crowdstrike tag: %s", exc)
 
         for field in self._CS_DEVICE_FIELDS:
+            if not self.nb.extras.custom_fields.get(name=field["name"]):
+                log.info("Creating custom field: %s on dcim.device", field["name"])
+                if not self.dry_run:
+                    try:
+                        self.nb.extras.custom_fields.create(field)
+                    except Exception as exc:
+                        log.error("Could not create custom field %s: %s", field["name"], exc)
+
+    def ensure_crowdstrike_all_fields(self) -> None:
+        """Create all CrowdStrike custom fields (base + extended) and the tag."""
+        self.ensure_crowdstrike_device_fields()
+        self.ensure_mac_address_fields()
+        for field in self._CS_DEVICE_FIELDS_EXTENDED:
             if not self.nb.extras.custom_fields.get(name=field["name"]):
                 log.info("Creating custom field: %s on dcim.device", field["name"])
                 if not self.dry_run:
@@ -432,6 +588,56 @@ class NetBoxClient:
         except Exception as exc:
             log.debug("MAC device lookup failed for %s: %s", mac, exc)
         return None
+
+    def get_device_by_any_ip(self, ips: list[str]) -> Optional[object]:
+        """
+        Try each IP in *ips* in turn and return the first NetBox device found.
+        Checks ipam.ip_addresses for each address (plain or CIDR); follows the
+        assignment back to a device interface.
+        """
+        for ip in ips:
+            if not ip:
+                continue
+            try:
+                dev = self.get_device_by_ip(ip)
+                if dev:
+                    return dev
+            except Exception as exc:
+                log.debug("any-IP lookup failed for %s: %s", ip, exc)
+        return None
+
+    def get_device_by_fqdn(self, fqdn: str) -> Optional[object]:
+        """
+        Try to match a device by its fully-qualified domain name.
+        Checks:
+          1. Exact device-name match against the full FQDN
+          2. Exact device-name match against the short hostname (first label)
+        The short-hostname fallback handles cases where NetBox stores "web01"
+        but CrowdStrike reports "web01.corp.example.com".
+        """
+        if not fqdn:
+            return None
+        try:
+            dev = self.nb.dcim.devices.get(name=fqdn)
+            if dev:
+                return dev
+            if "." in fqdn:
+                short = fqdn.split(".")[0]
+                dev = self.nb.dcim.devices.get(name=short)
+                if dev:
+                    return dev
+        except Exception as exc:
+            log.debug("FQDN device lookup failed for %s: %s", fqdn, exc)
+        return None
+
+    def get_device_by_discover_id(self, discover_id: str) -> Optional[object]:
+        """Return the NetBox device whose cs_discover_id custom field matches *discover_id*."""
+        try:
+            results = list(self.nb.dcim.devices.filter(**{"cf_cs_discover_id": discover_id}))
+            return results[0] if results else None
+        except Exception as exc:
+            log.debug("Discover ID lookup failed for %s: %s", discover_id, exc)
+            return None
 
     def ensure_meraki_network_field(self) -> None:
         """Create the meraki_network_id custom field on dcim.site if absent."""
