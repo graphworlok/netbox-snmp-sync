@@ -100,13 +100,6 @@ def drift_device(info: DeviceInfo, nb: NetBoxClient) -> DriftReport:
     else:
         log.debug("  → no serial number collected; skipping serial lookup")
 
-    if nb_device is None:
-        nb_device = nb.get_device_by_name(info.hostname)
-        if nb_device:
-            log.debug("  → matched by hostname %r → NetBox id=%s", info.hostname, nb_device.id)
-        else:
-            log.debug("  → hostname %r not found in NetBox", info.hostname)
-
     if nb_device is None and short_hostname and short_hostname != info.hostname:
         nb_device = nb.get_device_by_name(short_hostname)
         if nb_device:
@@ -114,6 +107,13 @@ def drift_device(info: DeviceInfo, nb: NetBoxClient) -> DriftReport:
                       short_hostname, nb_device.id)
         else:
             log.debug("  → short hostname %r not found in NetBox", short_hostname)
+
+    if nb_device is None:
+        nb_device = nb.get_device_by_name(info.hostname)
+        if nb_device:
+            log.debug("  → matched by hostname %r → NetBox id=%s", info.hostname, nb_device.id)
+        else:
+            log.debug("  → hostname %r not found in NetBox", info.hostname)
 
     if nb_device is None:
         nb_device = nb.get_device_by_vc_name(info.hostname)
@@ -311,21 +311,21 @@ def _build_stack_drift(info: DeviceInfo, nb: NetBoxClient, report: DriftReport) 
             log.debug("    → no serial for member %d; skipping serial lookup",
                       member.member_number)
 
-        if nb_dev is None:
-            nb_dev = nb.get_device_by_name(member_name)
-            if nb_dev:
-                log.debug("    → matched by name %r → NetBox id=%s", member_name, nb_dev.id)
-            else:
-                log.debug("    → name %r not found in NetBox", member_name)
-
         if nb_dev is None and short_member_name != member_name:
             nb_dev = nb.get_device_by_name(short_member_name)
             if nb_dev:
                 log.debug("    → matched by short name %r → NetBox id=%s",
                           short_member_name, nb_dev.id)
             else:
-                log.debug("    → short name %r not found in NetBox — member will be created",
-                          short_member_name)
+                log.debug("    → short name %r not found in NetBox", short_member_name)
+
+        if nb_dev is None:
+            nb_dev = nb.get_device_by_name(member_name)
+            if nb_dev:
+                log.debug("    → matched by name %r → NetBox id=%s", member_name, nb_dev.id)
+            else:
+                log.debug("    → name %r not found in NetBox — member will be created",
+                          member_name)
 
         if nb_dev is None:
             member_info = DeviceInfo(
@@ -465,7 +465,8 @@ def apply_report(
                             device_id = result.id
                 else:
                     dev = (
-                        nb.get_device_by_name(item.identifier)
+                        nb.get_device_by_name(_short_hostname(item.identifier))
+                        or nb.get_device_by_name(item.identifier)
                         or nb.get_device_by_ip(report.device_ip)
                     )
                     if dev:
@@ -483,7 +484,10 @@ def apply_report(
                     target_device_id = member_device_ids[iface_device_name]
                 elif member_device_ids or iface_device_name != report.hostname:
                     # Stack run — member device may already exist in NetBox
-                    dev = nb.get_device_by_name(iface_device_name)
+                    dev = (
+                        nb.get_device_by_name(_short_hostname(iface_device_name))
+                        or nb.get_device_by_name(iface_device_name)
+                    )
                     target_device_id = dev.id if dev else None
                     if target_device_id:
                         member_device_ids[iface_device_name] = target_device_id
@@ -491,7 +495,8 @@ def apply_report(
                     # Non-stack: resolve the single device id
                     if device_id is None:
                         dev = (
-                            nb.get_device_by_name(report.hostname)
+                            nb.get_device_by_name(_short_hostname(report.hostname))
+                            or nb.get_device_by_name(report.hostname)
                             or nb.get_device_by_ip(report.device_ip)
                         )
                         device_id = dev.id if dev else None
@@ -788,19 +793,19 @@ def _resolve_remote_device(nbr: object, nb: NetBoxClient) -> Optional[object]:
     remote_ip: str = getattr(nbr, "remote_ip", "") or ""
     short = _short_hostname(remote_id)
 
-    dev = nb.get_device_by_name(remote_id)
-    if dev:
-        return dev
-
     if short != remote_id:
         dev = nb.get_device_by_name(short)
         if dev:
             return dev
 
-    # Could be a VC — look up the member that owns the remote port
-    dev = _resolve_vc_member_by_port(remote_id, nbr.remote_port_id, nb)  # type: ignore[attr-defined]
+    dev = nb.get_device_by_name(remote_id)
+    if dev:
+        return dev
+
+    # Could be a VC — look up the member that owns the remote port (short first)
+    dev = _resolve_vc_member_by_port(short, nbr.remote_port_id, nb)  # type: ignore[attr-defined]
     if dev is None and short != remote_id:
-        dev = _resolve_vc_member_by_port(short, nbr.remote_port_id, nb)  # type: ignore[attr-defined]
+        dev = _resolve_vc_member_by_port(remote_id, nbr.remote_port_id, nb)  # type: ignore[attr-defined]
     if dev:
         return dev
 
