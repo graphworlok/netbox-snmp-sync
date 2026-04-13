@@ -164,7 +164,30 @@ class NetBoxClient:
             return None
 
     def get_device_by_name(self, name: str) -> Optional[object]:
+        if not name:
+            return None
         return self.nb.dcim.devices.get(name=name)
+
+    def get_device_by_vc_name(self, vc_name: str) -> Optional[object]:
+        """
+        Return the master (or first) member device of a virtual chassis whose
+        name matches *vc_name*.  Returns None if no matching VC exists.
+        """
+        if not vc_name:
+            return None
+        try:
+            vc = self.nb.dcim.virtual_chassis.get(name=vc_name)
+            if not vc:
+                return None
+            master = getattr(vc, "master", None)
+            if master:
+                return master
+            # Fallback: return the first member device found in the VC
+            members = list(self.nb.dcim.devices.filter(virtual_chassis_id=vc.id))
+            return members[0] if members else None
+        except Exception as exc:
+            log.debug("VC name lookup failed for %s: %s", vc_name, exc)
+            return None
 
     def get_device_by_ip(self, ip: str) -> Optional[object]:
         # Try primary IP lookup via IP address object

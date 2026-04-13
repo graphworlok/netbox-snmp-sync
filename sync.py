@@ -67,10 +67,12 @@ def drift_device(info: DeviceInfo, nb: NetBoxClient) -> DriftReport:
     """
     report = DriftReport(device_ip=info.query_ip, hostname=info.display_name)
 
+    short_hostname = _short_hostname(info.hostname)
+
     log.debug(
-        "Lookup [%s]  serial=%r  hostname=%r  ip=%s",
+        "Lookup [%s]  serial=%r  hostname=%r  short=%r  ip=%s",
         info.display_name, info.serial_number or "(none)",
-        info.hostname, info.query_ip,
+        info.hostname, short_hostname, info.query_ip,
     )
 
     # Stack: delegate to dedicated handler
@@ -86,7 +88,7 @@ def drift_device(info: DeviceInfo, nb: NetBoxClient) -> DriftReport:
         _build_stack_drift(info, nb, report)
         return report
 
-    # Non-stack: serial-first lookup, then hostname, then IP
+    # Non-stack: serial → full hostname → short hostname → virtual chassis → IP
     nb_device = None
     if info.serial_number:
         nb_device = nb.get_device_by_serial(info.serial_number)
@@ -104,6 +106,24 @@ def drift_device(info: DeviceInfo, nb: NetBoxClient) -> DriftReport:
             log.debug("  → matched by hostname %r → NetBox id=%s", info.hostname, nb_device.id)
         else:
             log.debug("  → hostname %r not found in NetBox", info.hostname)
+
+    if nb_device is None and short_hostname and short_hostname != info.hostname:
+        nb_device = nb.get_device_by_name(short_hostname)
+        if nb_device:
+            log.debug("  → matched by short hostname %r → NetBox id=%s",
+                      short_hostname, nb_device.id)
+        else:
+            log.debug("  → short hostname %r not found in NetBox", short_hostname)
+
+    if nb_device is None:
+        nb_device = nb.get_device_by_vc_name(info.hostname)
+        if nb_device is None and short_hostname != info.hostname:
+            nb_device = nb.get_device_by_vc_name(short_hostname)
+        if nb_device:
+            log.debug("  → matched via virtual chassis name → NetBox id=%s name=%r",
+                      nb_device.id, str(nb_device))
+        else:
+            log.debug("  → no virtual chassis found for %r", info.hostname)
 
     if nb_device is None:
         nb_device = nb.get_device_by_ip(info.query_ip)
@@ -238,13 +258,15 @@ def _build_stack_drift(info: DeviceInfo, nb: NetBoxClient, report: DriftReport) 
     for member in sorted(info.stack_members, key=lambda sm: sm.member_number):
         member_name = f"{info.hostname}-{member.member_number}"
 
+        short_member_name = f"{_short_hostname(info.hostname)}-{member.member_number}"
+
         log.debug(
-            "  Stack member %d  name=%r  serial=%r  model=%r",
-            member.member_number, member_name,
+            "  Stack member %d  name=%r  short=%r  serial=%r  model=%r",
+            member.member_number, member_name, short_member_name,
             member.serial_number or "(none)", member.model or "(none)",
         )
 
-        # Serial-first lookup, then by generated member name
+        # serial → full member name → short member name → VC member lookup
         nb_dev = None
         if member.serial_number:
             nb_dev = nb.get_device_by_serial(member.serial_number)
@@ -262,8 +284,16 @@ def _build_stack_drift(info: DeviceInfo, nb: NetBoxClient, report: DriftReport) 
             if nb_dev:
                 log.debug("    → matched by name %r → NetBox id=%s", member_name, nb_dev.id)
             else:
-                log.debug("    → name %r not found in NetBox — member will be created",
-                          member_name)
+                log.debug("    → name %r not found in NetBox", member_name)
+
+        if nb_dev is None and short_member_name != member_name:
+            nb_dev = nb.get_device_by_name(short_member_name)
+            if nb_dev:
+                log.debug("    → matched by short name %r → NetBox id=%s",
+                          short_member_name, nb_dev.id)
+            else:
+                log.debug("    → short name %r not found in NetBox — member will be created",
+                          short_member_name)
 
         if nb_dev is None:
             member_info = DeviceInfo(
@@ -755,6 +785,11 @@ def _resolve_site(info: DeviceInfo, nb: NetBoxClient) -> Optional[object]:
 # ---------------------------------------------------------------------------
 # Utility
 # ---------------------------------------------------------------------------
+
+def _short_hostname(hostname: str) -> str:
+    """Return the first DNS label of *hostname* (everything before the first dot)."""
+    return hostname.split(".")[0] if hostname else hostname
+
 
 def _check(
     diffs: list[FieldDiff],
