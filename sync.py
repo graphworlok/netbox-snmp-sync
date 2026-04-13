@@ -559,13 +559,8 @@ def sync_mac_table(
     """
     Sync per-interface MAC address tables to native NetBox dcim.mac_addresses objects.
 
-    For each interface with learned MACs:
-    - Creates new MAC address objects, populating the 'vendor' custom field via
-      IEEE OUI lookup (requires OUI_FILE in config.py).
-    - Clears the 'stale' tag from MACs that are seen again.
-    - Tags MACs no longer present as 'stale'.
-
-    The 'stale' tag and MAC custom fields are created automatically on first run.
+    For stacked devices, interfaces are resolved against the individual member
+    devices rather than a single parent device.
 
     Returns totals: {"created": N, "refreshed": N, "stale": N, "unchanged": N, "skipped": N}.
     """
@@ -580,16 +575,7 @@ def sync_mac_table(
         if not device.mac_table:
             continue
 
-        nb_device = (
-            nb.get_device_by_name(device.hostname)
-            or nb.get_device_by_ip(device.query_ip)
-        )
-        if nb_device is None:
-            log.debug("MAC table sync: device %s not in NetBox yet", device.display_name)
-            totals["skipped"] += len(device.mac_table)
-            continue
-
-        # Group MACs by interface, building a vendor map at the same time
+        # Group MACs by interface name first
         by_iface: dict[str, set[str]] = {}
         vendor_map: dict[str, str] = {}
         for entry in device.mac_table:
@@ -599,10 +585,24 @@ def sync_mac_table(
             if entry.mac_address not in vendor_map:
                 vendor_map[entry.mac_address] = oui.lookup(entry.mac_address)
 
+        # Build a map of interface name → NetBox device for this device/stack
+        iface_device_map = _resolve_iface_devices(device, nb)
+        if not iface_device_map:
+            log.debug("MAC table sync: no NetBox devices found for %s", device.display_name)
+            totals["skipped"] += len(device.mac_table)
+            continue
+
         log.info("MAC table sync: %s  %d interface(s)", device.display_name, len(by_iface))
 
         for if_name, macs in by_iface.items():
-            nb_iface = nb.get_interface(nb_device.id, if_name)
+            nb_dev = iface_device_map.get(if_name)
+            if nb_dev is None:
+                log.debug("MAC table sync: interface %s/%s — no member device resolved",
+                          device.display_name, if_name)
+                totals["skipped"] += len(macs)
+                continue
+
+            nb_iface = nb.get_interface(nb_dev.id, if_name)
             if nb_iface is None:
                 log.debug("MAC table sync: interface %s/%s not in NetBox",
                           device.display_name, if_name)
@@ -647,28 +647,28 @@ def sync_cables(
     seen_pairs: set[frozenset] = set()
 
     for device in devices:
-        nb_device = (
-            nb.get_device_by_name(device.hostname)
-            or nb.get_device_by_ip(device.query_ip)
-        )
-        if nb_device is None:
-            log.debug("Cable sync: device %s not in NetBox, skipping",
+        # Build interface name → NetBox device map (handles stacks correctly)
+        iface_device_map = _resolve_iface_devices(device, nb)
+        if not iface_device_map:
+            log.debug("Cable sync: no NetBox devices found for %s, skipping",
                       device.display_name)
             continue
 
-        nb_ifaces = {i.name: i for i in nb.get_interfaces(nb_device.id)}
-
         for nbr in device.neighbors:
-            local_nb_iface = nb_ifaces.get(nbr.local_if_name)
+            local_nb_dev = iface_device_map.get(nbr.local_if_name)
+            if local_nb_dev is None:
+                log.debug("Cable sync: local iface %s/%s — no member device resolved",
+                          device.display_name, nbr.local_if_name)
+                continue
+
+            local_nb_iface = nb.get_interface(local_nb_dev.id, nbr.local_if_name)
             if local_nb_iface is None:
                 log.debug("Cable sync: local iface %s/%s not in NetBox",
                           device.display_name, nbr.local_if_name)
                 continue
 
-            remote_device = (
-                nb.get_device_by_name(nbr.remote_device_id)
-                or (nb.get_device_by_ip(nbr.remote_ip) if nbr.remote_ip else None)
-            )
+            # Remote device: try name, short name, VC member lookup, then IP
+            remote_device = _resolve_remote_device(nbr, nb)
             if remote_device is None:
                 log.info(
                     "Cable sync: remote device %r not in NetBox "
@@ -677,7 +677,8 @@ def sync_cables(
                 )
                 continue
 
-            remote_nb_iface = nb.get_interface(remote_device.id, nbr.remote_port_id)
+            # Remote interface: the port may live on a stack member
+            remote_nb_iface = _resolve_remote_iface(remote_device, nbr.remote_port_id, nb)
             if remote_nb_iface is None:
                 log.debug("Cable sync: remote iface %s/%s not in NetBox",
                           nbr.remote_device_id, nbr.remote_port_id)
@@ -713,6 +714,151 @@ def sync_cables(
                 created += 1   # count as "would create" in dry-run
 
     return created
+
+
+# ---------------------------------------------------------------------------
+# Stack-aware interface / device resolution helpers
+# ---------------------------------------------------------------------------
+
+def _resolve_iface_devices(device: DeviceInfo, nb: NetBoxClient) -> dict[str, object]:
+    """
+    Return a mapping of {interface_name: nb_device} for every interface on
+    *device*.
+
+    For stacked devices each interface is routed to its member device (derived
+    from the slot number in the interface name).  For a non-stack device every
+    interface maps to the single NetBox device.
+
+    Returns an empty dict if no NetBox device can be found.
+    """
+    if not device.stack_members:
+        nb_dev = (
+            nb.get_device_by_serial(device.serial_number)
+            or nb.get_device_by_name(_short_hostname(device.hostname))
+            or nb.get_device_by_name(device.hostname)
+            or nb.get_device_by_ip(device.query_ip)
+        )
+        if nb_dev is None:
+            return {}
+        return {iface.name: nb_dev for iface in device.interfaces}
+
+    short = _short_hostname(device.hostname)
+
+    # Build member_number → nb_device cache
+    member_nb_devs: dict[int, object] = {}
+    for member in device.stack_members:
+        nb_dev = None
+        if member.serial_number:
+            nb_dev = nb.get_device_by_serial(member.serial_number)
+        if nb_dev is None:
+            nb_dev = nb.get_device_by_name(f"{short}-{member.member_number}")
+        if nb_dev is None:
+            nb_dev = nb.get_device_by_name(f"{device.hostname}-{member.member_number}")
+        if nb_dev:
+            member_nb_devs[member.member_number] = nb_dev
+        else:
+            log.debug("_resolve_iface_devices: member %d of %s not found in NetBox",
+                      member.member_number, device.display_name)
+
+    if not member_nb_devs:
+        return {}
+
+    result: dict[str, object] = {}
+    for iface in device.interfaces:
+        member_num = _stack_member_from_iface_name(iface.name)
+        if member_num == 0:
+            member_num = 1
+        nb_dev = member_nb_devs.get(member_num) or next(iter(member_nb_devs.values()))
+        result[iface.name] = nb_dev
+    return result
+
+
+def _resolve_remote_device(nbr: object, nb: NetBoxClient) -> Optional[object]:
+    """
+    Resolve the remote device for a cable endpoint.
+
+    Tries in order:
+      1. Exact name match (CDP/LLDP device-id as reported)
+      2. Short hostname match
+      3. Virtual chassis master/member lookup (for stacks that advertise
+         the VC name rather than a member name via CDP/LLDP)
+      4. Management IP
+    """
+    remote_id: str = nbr.remote_device_id  # type: ignore[attr-defined]
+    remote_ip: str = getattr(nbr, "remote_ip", "") or ""
+    short = _short_hostname(remote_id)
+
+    dev = nb.get_device_by_name(remote_id)
+    if dev:
+        return dev
+
+    if short != remote_id:
+        dev = nb.get_device_by_name(short)
+        if dev:
+            return dev
+
+    # Could be a VC — look up the member that owns the remote port
+    dev = _resolve_vc_member_by_port(remote_id, nbr.remote_port_id, nb)  # type: ignore[attr-defined]
+    if dev is None and short != remote_id:
+        dev = _resolve_vc_member_by_port(short, nbr.remote_port_id, nb)  # type: ignore[attr-defined]
+    if dev:
+        return dev
+
+    if remote_ip:
+        dev = nb.get_device_by_ip(remote_ip)
+    return dev
+
+
+def _resolve_vc_member_by_port(vc_name: str, port_name: str, nb: NetBoxClient) -> Optional[object]:
+    """
+    If *vc_name* matches a virtual chassis, return the member device that owns
+    *port_name* by deriving the member number from the port name.
+    """
+    try:
+        vc = nb.get_virtual_chassis(vc_name)
+        if not vc:
+            return None
+        member_num = _stack_member_from_iface_name(port_name)
+        if member_num == 0:
+            member_num = 1
+        # Try <vc_name>-<N> and short-<vc_name>-<N>
+        short = _short_hostname(vc_name)
+        for candidate in (f"{short}-{member_num}", f"{vc_name}-{member_num}"):
+            dev = nb.get_device_by_name(candidate)
+            if dev:
+                return dev
+        # Fall back to VC master
+        return getattr(vc, "master", None)
+    except Exception as exc:
+        log.debug("VC member port resolution failed for %s/%s: %s", vc_name, port_name, exc)
+        return None
+
+
+def _resolve_remote_iface(remote_device: object, port_name: str, nb: NetBoxClient) -> Optional[object]:
+    """
+    Look up a remote interface.  If the direct lookup on *remote_device* misses
+    (e.g. the interface actually belongs to a stack member), also try searching
+    by VC membership.
+    """
+    iface = nb.get_interface(remote_device.id, port_name)  # type: ignore[attr-defined]
+    if iface:
+        return iface
+
+    # remote_device might be the VC master; the port may be on a different member
+    vc = getattr(remote_device, "virtual_chassis", None)
+    if not vc:
+        return None
+    try:
+        member_num = _stack_member_from_iface_name(port_name)
+        if member_num == 0:
+            return None
+        members = list(nb.nb.dcim.devices.filter(virtual_chassis_id=vc.id))
+        for member in members:
+            if getattr(member, "vc_position", None) == member_num:
+                return nb.get_interface(member.id, port_name)
+    except Exception as exc:
+        log.debug("Remote iface VC member search failed: %s", exc)
+    return None
 
 
 # ---------------------------------------------------------------------------
