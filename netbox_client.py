@@ -269,11 +269,40 @@ class NetBoxClient:
         if iface:
             iface.update(payload)
 
+    def set_interface_uncontrolled_tag(self, iface: object, add: bool) -> None:
+        """
+        Add or remove the 'unmanaged-multimac' tag on *iface*.
+        No-ops if the tag is already in the desired state.
+        """
+        slug = self._UNCONTROLLED_TAG["slug"]
+        current_slugs = [t.slug for t in (getattr(iface, "tags", None) or [])]
+        has_tag = slug in current_slugs
+
+        if add and not has_tag:
+            log.info("TAG unmanaged-multimac: interface id=%s (%s)",
+                     iface.id, getattr(iface, "name", ""))
+            if not self.dry_run:
+                try:
+                    iface.update({"tags": [{"slug": s} for s in current_slugs] + [{"slug": slug}]})
+                except Exception as exc:
+                    log.error("Could not add unmanaged-multimac tag to interface %s: %s",
+                              iface.id, exc)
+        elif not add and has_tag:
+            log.info("UNTAG unmanaged-multimac: interface id=%s (%s)",
+                     iface.id, getattr(iface, "name", ""))
+            if not self.dry_run:
+                try:
+                    iface.update({"tags": [{"slug": s} for s in current_slugs if s != slug]})
+                except Exception as exc:
+                    log.error("Could not remove unmanaged-multimac tag from interface %s: %s",
+                              iface.id, exc)
+
     # ------------------------------------------------------------------
     # MAC addresses (native dcim.mac_addresses — NetBox 4.1+)
     # ------------------------------------------------------------------
 
     _STALE_TAG = {"name": "stale", "slug": "stale", "color": "9e9e9e"}
+    _UNCONTROLLED_TAG = {"name": "unmanaged-multimac", "slug": "unmanaged-multimac", "color": "f44336"}
 
     _MAC_CUSTOM_FIELDS: list[dict] = [
         {
@@ -295,14 +324,15 @@ class NetBoxClient:
     ]
 
     def ensure_mac_address_fields(self) -> None:
-        """Create the 'stale' tag and MAC address custom fields if absent."""
-        if not self.nb.extras.tags.get(slug="stale"):
-            log.info("Creating tag: stale")
-            if not self.dry_run:
-                try:
-                    self.nb.extras.tags.create(self._STALE_TAG)
-                except Exception as exc:
-                    log.error("Could not create stale tag: %s", exc)
+        """Create required tags and MAC address custom fields if absent."""
+        for tag in (self._STALE_TAG, self._UNCONTROLLED_TAG):
+            if not self.nb.extras.tags.get(slug=tag["slug"]):
+                log.info("Creating tag: %s", tag["slug"])
+                if not self.dry_run:
+                    try:
+                        self.nb.extras.tags.create(tag)
+                    except Exception as exc:
+                        log.error("Could not create tag %s: %s", tag["slug"], exc)
 
         for field in self._MAC_CUSTOM_FIELDS:
             if not self.nb.extras.custom_fields.get(name=field["name"]):

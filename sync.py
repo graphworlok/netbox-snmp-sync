@@ -580,6 +580,12 @@ def sync_mac_table(
         if not device.mac_table:
             continue
 
+        # Build set of interface names that have a CDP/LLDP neighbour
+        neighbour_ifaces: set[str] = set()
+        for nbr in device.neighbors:
+            for variant in _iface_name_variants(nbr.local_if_name):
+                neighbour_ifaces.add(variant)
+
         # Group MACs by interface name first
         by_iface: dict[str, set[str]] = {}
         vendor_map: dict[str, str] = {}
@@ -614,9 +620,20 @@ def sync_mac_table(
                 totals["skipped"] += len(macs)
                 continue
 
-            if dry_run:
-                log.info("  [dry-run] %s/%s  %d MAC(s)",
+            # Determine whether this port looks like it has an unmanaged_multimac device:
+            # more than one MAC visible and no CDP/LLDP neighbour on the port.
+            has_neighbour = bool(
+                neighbour_ifaces.intersection(_iface_name_variants(if_name))
+            )
+            unmanaged_multimac = len(macs) > 1 and not has_neighbour
+            if unmanaged_multimac:
+                log.info("  UNCONTROLLED device suspected on %s/%s (%d MACs, no CDP/LLDP)",
                          device.display_name, if_name, len(macs))
+
+            if dry_run:
+                log.info("  [dry-run] %s/%s  %d MAC(s)%s",
+                         device.display_name, if_name, len(macs),
+                         "  [unmanaged_multimac]" if unmanaged_multimac else "")
                 totals["created"] += len(macs)
                 continue
 
@@ -627,6 +644,8 @@ def sync_mac_table(
             except Exception as exc:
                 log.error("MAC sync failed %s/%s: %s", device.display_name, if_name, exc)
                 totals["skipped"] += len(macs)
+
+            nb.set_interface_unmanaged_multimac_tag(nb_iface, add=unmanaged_multimac)
 
     return totals
 
