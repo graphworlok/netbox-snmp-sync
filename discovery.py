@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import socket
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -58,6 +59,23 @@ def _neighbour_ips(device: DeviceInfo) -> list[str]:
     return candidates
 
 
+def _collect_one(ip: str, depth: int) -> tuple[str, int, object, Optional[str]]:
+    """
+    Collect a single device.  Returns (ip, depth, DeviceInfo|None, cred_name|None).
+    Designed to be called from a thread pool.
+    """
+    creds = _credentials_for(ip)
+    collector = make_collector(
+        ip, creds,
+        port=config.SNMP_PORT,
+        timeout=config.SNMP_TIMEOUT,
+        retries=config.SNMP_RETRIES,
+    )
+    device = collector.collect()
+    cred_name = collector.working_credential_name()
+    return ip, depth, device, cred_name
+
+
 def run(
     seed_ips: list[str],
     max_depth: Optional[int] = None,
@@ -67,47 +85,65 @@ def run(
     ----------
     seed_ips    Initial list of device IPs to query.
     max_depth   Override config.DISCOVERY_MAX_DEPTH (None = use config).
+
+    Devices at each BFS depth level are polled concurrently using up to
+    config.SNMP_WORKERS threads.  Neighbour IPs discovered at depth N are
+    collected as a batch at depth N+1, keeping discovery deterministic.
     """
     if max_depth is None:
         max_depth = config.DISCOVERY_MAX_DEPTH
 
     result = DiscoveryResult()
-    visited: set[str] = set()   # IPs we have already attempted
-    queue: list[tuple[str, int]] = [(ip, 0) for ip in seed_ips]
+    visited: set[str] = set()
 
-    while queue:
-        ip, depth = queue.pop(0)
-        if ip in visited:
-            continue
-        visited.add(ip)
+    # Seed the first batch
+    current_batch: list[tuple[str, int]] = []
+    for ip in seed_ips:
+        if ip not in visited:
+            visited.add(ip)
+            current_batch.append((ip, 0))
 
-        creds = _credentials_for(ip)
-        collector = make_collector(
-            ip, creds,
-            port=config.SNMP_PORT,
-            timeout=config.SNMP_TIMEOUT,
-            retries=config.SNMP_RETRIES,
-        )
+    workers = max(1, config.SNMP_WORKERS)
 
-        log.info("[depth=%d] Querying %s …", depth, ip)
-        device = collector.collect()
+    while current_batch:
+        depth = current_batch[0][1]
+        log.info("[depth=%d] Polling %d device(s) concurrently (workers=%d)…",
+                 depth, len(current_batch), workers)
 
-        if device is None:
-            log.warning("  Unreachable: %s", ip)
-            result.unreachable.append(ip)
-            continue
+        next_batch: list[tuple[str, int]] = []
 
-        cred_name = collector.working_credential_name() or "unknown"
-        log.info("  OK  %-40s  platform=%-8s  cred=%s",
-                 device.display_name, device.platform.value, cred_name)
-        result.collected.append(device)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(_collect_one, ip, d): ip
+                for ip, d in current_batch
+            }
+            for future in as_completed(futures):
+                try:
+                    ip, d, device, cred_name = future.result()
+                except Exception as exc:
+                    ip = futures[future]
+                    log.error("  Error collecting %s: %s", ip, exc)
+                    result.unreachable.append(ip)
+                    continue
 
-        # Auto-discover neighbours
-        if config.AUTO_DISCOVER_NEIGHBORS and depth < max_depth:
-            for nbr_ip in _neighbour_ips(device):
-                if nbr_ip not in visited:
-                    log.debug("  Enqueuing neighbour %s (depth %d)",
-                              nbr_ip, depth + 1)
-                    queue.append((nbr_ip, depth + 1))
+                if device is None:
+                    log.warning("  Unreachable: %s", ip)
+                    result.unreachable.append(ip)
+                    continue
+
+                log.info("  OK  %-40s  platform=%-8s  cred=%s",
+                         device.display_name, device.platform.value,
+                         cred_name or "unknown")
+                result.collected.append(device)
+
+                if config.AUTO_DISCOVER_NEIGHBORS and d < max_depth:
+                    for nbr_ip in _neighbour_ips(device):
+                        if nbr_ip not in visited:
+                            log.debug("  Enqueuing neighbour %s (depth %d)",
+                                      nbr_ip, d + 1)
+                            visited.add(nbr_ip)
+                            next_batch.append((nbr_ip, d + 1))
+
+        current_batch = next_batch
 
     return result

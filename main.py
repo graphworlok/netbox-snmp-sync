@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import click
@@ -94,6 +95,42 @@ def _collect_seed_ips(ips: tuple[str, ...], ip_file: str | None) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Parallel drift detection
+# ---------------------------------------------------------------------------
+
+def _parallel_drift(
+    devices: list,
+    dry_run: bool = False,
+) -> list[DriftReport]:
+    """
+    Run drift_device() for every device concurrently.
+
+    Each worker gets its own NetBoxClient (requests Session is not
+    thread-safe for concurrent use).  Results are returned in the same
+    order as *devices*.
+    """
+    workers = max(1, config.NETBOX_WORKERS)
+    reports: list[DriftReport] = [None] * len(devices)  # type: ignore[list-item]
+
+    def _run(idx: int, device) -> tuple[int, DriftReport]:
+        nb = NetBoxClient(config.NETBOX_URL, config.NETBOX_TOKEN, dry_run=dry_run)
+        return idx, sync_mod.drift_device(device, nb)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_run, i, d): i for i, d in enumerate(devices)}
+        for future in as_completed(futures):
+            try:
+                idx, report = future.result()
+                reports[idx] = report
+            except Exception as exc:
+                i = futures[future]
+                log.error("Drift detection failed for %s: %s",
+                          devices[i].display_name, exc)
+
+    return [r for r in reports if r is not None]
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -116,11 +153,7 @@ def cmd_drift(ips, ip_file, depth, no_discover, verbose):
 
     _print_discovery_summary(disc)
 
-    nb = NetBoxClient(config.NETBOX_URL, config.NETBOX_TOKEN, dry_run=True)
-    reports: list[DriftReport] = []
-    for device in disc.collected:
-        report = sync_mod.drift_device(device, nb)
-        reports.append(report)
+    reports: list[DriftReport] = _parallel_drift(disc.collected, dry_run=True)
 
     _print_drift_table(reports)
 
@@ -158,13 +191,13 @@ def cmd_sync(ips, ip_file, depth, no_discover, verbose, dry_run, no_create):
 
     _print_discovery_summary(disc)
 
-    nb = NetBoxClient(config.NETBOX_URL, config.NETBOX_TOKEN, dry_run=dry_run)
+    # Drift detection is read-only — run in parallel
+    reports = _parallel_drift(disc.collected, dry_run=dry_run)
 
+    # Apply is write-heavy with ordering constraints — keep sequential
+    nb = NetBoxClient(config.NETBOX_URL, config.NETBOX_TOKEN, dry_run=dry_run)
     total_applied = 0
-    reports: list[DriftReport] = []
-    for device in disc.collected:
-        report = sync_mod.drift_device(device, nb)
-        reports.append(report)
+    for report in reports:
         if not dry_run and report.has_drift:
             applied = sync_mod.apply_report(
                 report, nb,

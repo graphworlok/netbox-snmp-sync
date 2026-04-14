@@ -52,6 +52,13 @@ SNMP_PORT = 161
 SNMP_TIMEOUT = 5     # seconds per attempt
 SNMP_RETRIES = 2     # retries after timeout
 
+# --- Concurrency ---
+# Number of devices to poll via SNMP simultaneously during discovery.
+SNMP_WORKERS = 10
+# Number of parallel NetBox API workers used during drift detection.
+# Each worker uses its own HTTP session; set lower if NetBox rate-limits.
+NETBOX_WORKERS = 5
+
 # --- Auto-discovery ---
 # When True, CDP/LLDP neighbors not in the seed list are probed automatically.
 AUTO_DISCOVER_NEIGHBORS = True
