@@ -416,12 +416,13 @@ class SNMPCollector:
             mac_raw = phys_addrs.get(idx_str, "")
             mac = _format_mac(mac_raw)
 
-            admin_raw = int(admin_stats.get(idx_str, 2))
-            oper_raw  = int(oper_stats.get(idx_str, 4))
+            admin_raw = _safe_int(admin_stats.get(idx_str), default=2)
+            oper_raw  = _safe_int(oper_stats.get(idx_str),  default=4)
 
             # Prefer high-speed (Mbps → bps); fall back to ifSpeed (bps)
             hs = high_speeds.get(idx_str)
-            speed = int(hs) * 1_000_000 if hs and hs != "0" else int(speeds.get(idx_str, 0))
+            hs_int = _safe_int(hs)
+            speed = hs_int * 1_000_000 if hs_int else _safe_int(speeds.get(idx_str), default=0)
 
             ifaces[idx] = Interface(
                 index=idx,
@@ -818,6 +819,21 @@ def _format_mac(raw: str) -> str:
     if len(cleaned) == 12:
         return ":".join(cleaned[i:i+2] for i in range(0, 12, 2)).lower()
     return ""
+
+
+def _safe_int(value: Optional[str], default: int = 0) -> int:
+    """
+    Convert an SNMP string value to int, returning *default* on failure.
+    Guards against error message strings that pysnmp occasionally returns
+    in place of numeric OID values (e.g. 'No more variables left in this
+    MIB view').
+    """
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return default
 
 
 def _mask_to_prefix(mask: str) -> int:
