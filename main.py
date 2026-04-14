@@ -437,6 +437,106 @@ def _build_cs_index() -> dict[str, dict]:
                                 label, i // 100, status,
                                 (resp.get("body") or {}).get("errors"))
                     continue
+                resources = resp["body"].get("resources") or []
+                if resources and macs_added == 0 and i == 0:
+                    # Log the keys of the first asset so we can verify field names
+                    log.debug("CS Discover %s: first asset keys: %s",
+                              label, sorted(resources[0].keys()))
+                for asset in resources:
+                    asset_id = asset.get("id", "")
+                    url      = f"{console_url}/{url_path}/{asset_id}"
+                    macs_raw: list[str] = []
+                    for nic in (asset.get("network_interfaces") or []):
+                        m = nic.get("mac_address") or nic.get("mac") or ""
+                        if m:
+                            macs_raw.append(m)
+                    for field in ("mac_address", "mac", "primary_mac"):
+                        v = asset.get(field) or ""
+                        if v:
+                            macs_raw.append(v)
+                            break
+                    added = _add_macs(macs_raw, asset_id, url)
+                    if added:
+                        log.debug(
+                            "CS Discover %s: asset %s  hostname=%-30s  +%d MAC(s)",
+                            label, asset_id[:16],
+                            (asset.get("hostname") or asset.get("name") or "?")[:30],
+                            added,
+                        )
+                    else:
+                        log.debug("CS Discover %s: asset %s  hostname=%-30s  no MACs found",
+                                  label, asset_id[:16],
+                                  (asset.get("hostname") or asset.get("name") or "?")[:30])
+                    macs_added += added
+
+            log.info("CS Discover %s: %d MAC(s) from %d asset(s)", label, macs_added, len(all_ids))
+            return macs_added
+
+        # Unmanaged hosts — endpoints/assets visible to neighbouring sensors
+        # but without their own Falcon agent. Uses FEM scope (no Hosts:Read needed).
+        _scroll_and_fetch(
+            "unmanaged-hosts",
+            getattr(discover_svc, "query_hosts", None) or getattr(discover_svc, "QueryHosts", None),
+            getattr(discover_svc, "get_hosts",   None) or getattr(discover_svc, "GetHosts",   None),
+            "discover/hosts",
+        )
+
+    except Exception as exc:
+        log.warning("CS Discover (FEM) API failed: %s", exc, exc_info=True)
+
+    # ------------------------------------------------------------------ #
+    # 3. ExposureManagement API — external attack surface / FEM           #
+    #    IoT and network devices are accessible here with FEM scope        #
+    # ------------------------------------------------------------------ #
+    log.debug("CS ExposureManagement: querying network/IoT assets…")
+    try:
+        from falconpy import ExposureManagement
+        fem_svc = ExposureManagement(
+            client_id=creds["client_id"],
+            client_secret=creds["client_secret"],
+        )
+        log.debug("CS ExposureManagement: available methods: %s",
+                  [m for m in dir(fem_svc) if not m.startswith("_")])
+
+        def _fem_scroll_and_fetch(label: str, query_fn, get_fn, url_path: str, page_limit: int = 100) -> int:
+            if query_fn is None or get_fn is None:
+                log.debug("CS ExposureManagement: %s — method not available", label)
+                return 0
+            all_ids: list[str] = []
+            offset = 0
+            page = 0
+            while True:
+                resp = query_fn(limit=page_limit, offset=offset)
+                status = resp.get("status_code")
+                if status == 403:
+                    log.info("CS ExposureManagement %s: HTTP 403 — check FEM API scope", label)
+                    return 0
+                if status != 200:
+                    log.warning("CS ExposureManagement %s: query page %d HTTP %s: %s",
+                                label, page, status,
+                                (resp.get("body") or {}).get("errors"))
+                    return 0
+                ids   = resp["body"].get("resources") or []
+                total = (resp["body"].get("meta") or {}).get("pagination", {}).get("total", "?")
+                all_ids.extend(ids)
+                log.debug("CS ExposureManagement %s: page %d — %d id(s) (total %d / %s)",
+                          label, page, len(ids), len(all_ids), total)
+                page   += 1
+                offset += len(ids)
+                if not ids or len(ids) < page_limit:
+                    break
+
+            log.debug("CS ExposureManagement %s: %d id(s); fetching details…", label, len(all_ids))
+            macs_added = 0
+            for i in range(0, len(all_ids), 100):
+                batch = all_ids[i:i + 100]
+                resp = get_fn(ids=batch)
+                status = resp.get("status_code")
+                if status != 200:
+                    log.warning("CS ExposureManagement %s: get batch %d HTTP %s: %s",
+                                label, i // 100, status,
+                                (resp.get("body") or {}).get("errors"))
+                    continue
                 for asset in (resp["body"].get("resources") or []):
                     asset_id = asset.get("id", "")
                     url      = f"{console_url}/{url_path}/{asset_id}"
@@ -450,43 +550,34 @@ def _build_cs_index() -> dict[str, dict]:
                         macs_raw.append(top)
                     added = _add_macs(macs_raw, asset_id, url)
                     if added:
-                        log.debug(
-                            "CS Discover %s: asset %s  hostname=%-30s  +%d MAC(s)",
-                            label, asset_id[:16],
-                            (asset.get("hostname") or asset.get("name") or "?")[:30],
-                            added,
-                        )
+                        log.debug("CS ExposureManagement %s: asset %s  hostname=%-30s  +%d MAC(s)",
+                                  label, asset_id[:16],
+                                  (asset.get("hostname") or asset.get("name") or "?")[:30],
+                                  added)
                     macs_added += added
 
-            log.info("CS Discover %s: %d MAC(s) from %d asset(s)", label, macs_added, len(all_ids))
+            log.info("CS ExposureManagement %s: %d MAC(s) from %d asset(s)",
+                     label, macs_added, len(all_ids))
             return macs_added
 
-        # --- unmanaged hosts (sensors on neighbours, no local agent) ---
-        _scroll_and_fetch(
-            "unmanaged-hosts",
-            getattr(discover_svc, "query_hosts",     None) or getattr(discover_svc, "QueryHosts",    None),
-            getattr(discover_svc, "get_hosts",        None) or getattr(discover_svc, "GetHosts",      None),
-            "discover/hosts",
-        )
+        # Try every plausible method name for network/IoT assets under FEM
+        for _qlabel, _qname, _gname, _upath in [
+            ("iot-assets",   "query_iot_assets",   "get_iot_assets",   "exposure-management/iot-assets"),
+            ("network-assets","query_network_assets","get_network_assets","exposure-management/network-assets"),
+            ("assets",       "query_assets",        "get_assets",       "exposure-management/assets"),
+            ("devices",      "query_devices",       "get_devices",      "exposure-management/devices"),
+        ]:
+            _fem_scroll_and_fetch(
+                _qlabel,
+                getattr(fem_svc, _qname, None),
+                getattr(fem_svc, _gname, None),
+                _upath,
+            )
 
-        # --- IoT / network devices (switches, routers, cameras, etc.) ---
-        _scroll_and_fetch(
-            "iot-hosts",
-            getattr(discover_svc, "query_iot_hosts",  None) or getattr(discover_svc, "QueryIoTHosts", None),
-            getattr(discover_svc, "get_iot_hosts",    None) or getattr(discover_svc, "GetIoTHosts",   None),
-            "discover/iot-assets",
-        )
-
-        # --- legacy combined assets endpoint (older falconpy / older CID) ---
-        _scroll_and_fetch(
-            "assets (legacy)",
-            getattr(discover_svc, "query_assets",    None) or getattr(discover_svc, "QueryAssets",   None),
-            getattr(discover_svc, "get_assets",      None) or getattr(discover_svc, "GetAssets",     None),
-            "discover/assets",
-        )
-
+    except ImportError:
+        log.debug("CS ExposureManagement: falconpy.ExposureManagement not available in this build")
     except Exception as exc:
-        log.warning("CS Discover (FEM) API failed: %s", exc, exc_info=True)
+        log.warning("CS ExposureManagement API failed: %s", exc, exc_info=True)
 
     log.info("CS MAC index total: %d unique MAC(s) across Hosts + Discover", len(index))
     return index
