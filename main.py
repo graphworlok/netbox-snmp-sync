@@ -297,6 +297,8 @@ def _build_cs_index() -> dict[str, dict]:
 
     # ------------------------------------------------------------------ #
     # 1. Hosts API — sensor-managed endpoints                             #
+    #    403 means the credential only has FEM scope — that is fine,      #
+    #    Discover will cover unmanaged assets.                             #
     # ------------------------------------------------------------------ #
     log.debug("CS Hosts: starting scroll of managed devices…")
     try:
@@ -313,6 +315,12 @@ def _build_cs_index() -> dict[str, dict]:
                 kwargs["after"] = after
             resp = hosts_svc.query_devices_by_filter_scroll(**kwargs)
             status = resp.get("status_code")
+            if status == 403:
+                log.info(
+                    "CS Hosts: HTTP 403 — credential does not have Hosts:Read scope "
+                    "(FEM-only token is fine; Discover will cover unmanaged assets)"
+                )
+                break
             if status != 200:
                 log.warning("CS Hosts: scroll page %d returned HTTP %s: %s",
                             page, status,
@@ -365,81 +373,72 @@ def _build_cs_index() -> dict[str, dict]:
 
     # ------------------------------------------------------------------ #
     # 2. Discover API — Falcon Exposure Management (FEM)                  #
-    #    Covers unmanaged endpoints and unsupported network devices        #
+    #                                                                      #
+    # This version of falconpy exposes two asset classes separately:       #
+    #   query_hosts / get_hosts       — unmanaged endpoints                #
+    #   query_iot_hosts / get_iot_hosts — IoT / network devices            #
+    # (older builds used query_assets/get_assets for both; newer builds   #
+    #  split them — we try both styles and skip any that 403/fail)         #
     # ------------------------------------------------------------------ #
-    log.debug("CS Discover (FEM): querying unmanaged and unsupported assets…")
+    log.debug("CS Discover (FEM): querying unmanaged hosts and IoT/network devices…")
     try:
         discover_svc = Discover(
             client_id=creds["client_id"],
             client_secret=creds["client_secret"],
         )
 
-        # Resolve method names — falconpy exposes both snake_case and PascalCase
-        # depending on version; try snake_case first, fall back to PascalCase.
-        _query_fn = (
-            getattr(discover_svc, "query_assets", None)
-            or getattr(discover_svc, "QueryAssets", None)
-        )
-        _get_fn = (
-            getattr(discover_svc, "get_assets", None)
-            or getattr(discover_svc, "GetAssets", None)
-        )
+        def _scroll_and_fetch(
+            label: str,
+            query_fn,
+            get_fn,
+            url_path: str,
+        ) -> int:
+            """Generic scroll + details fetch for one Discover asset class."""
+            if query_fn is None or get_fn is None:
+                log.debug("CS Discover: %s — methods not available on this falconpy build", label)
+                return 0
 
-        if not _query_fn or not _get_fn:
-            available = [m for m in dir(discover_svc) if not m.startswith("_")]
-            log.warning(
-                "CS Discover: could not find query_assets/get_assets on the Discover "
-                "service class.  Available methods: %s",
-                available,
-            )
-        else:
-            all_asset_ids: list[str] = []
+            all_ids: list[str] = []
             offset = 0
             page = 0
             while True:
-                resp = _query_fn(
-                    filter="type:'unmanaged',type:'unsupported'",
-                    limit=5000,
-                    offset=offset,
-                )
+                resp = query_fn(limit=5000, offset=offset)
                 status = resp.get("status_code")
                 if status == 403:
-                    log.warning(
-                        "CS Discover: HTTP 403 — Falcon Discover / Exposure Management may "
-                        "not be licensed for this CID. Skipping FEM enrichment."
+                    log.info(
+                        "CS Discover %s: HTTP 403 — may not be licensed or scoped for this CID",
+                        label,
                     )
-                    break
+                    return 0
                 if status != 200:
-                    log.warning("CS Discover: query page %d returned HTTP %s: %s",
-                                page, status,
+                    log.warning("CS Discover %s: query page %d HTTP %s: %s",
+                                label, page, status,
                                 (resp.get("body") or {}).get("errors"))
-                    break
+                    return 0
                 ids   = resp["body"].get("resources") or []
                 total = (resp["body"].get("meta") or {}).get("pagination", {}).get("total", "?")
-                all_asset_ids.extend(ids)
-                log.debug("CS Discover: page %d — %d asset(s) (running total %d / %s)",
-                          page, len(ids), len(all_asset_ids), total)
+                all_ids.extend(ids)
+                log.debug("CS Discover %s: page %d — %d id(s) (total %d / %s)",
+                          label, page, len(ids), len(all_ids), total)
                 page   += 1
                 offset += len(ids)
                 if not ids or len(ids) < 5000:
                     break
 
-            log.debug("CS Discover: %d asset(s) found; fetching details in batches of 100…",
-                      len(all_asset_ids))
-            discover_macs = 0
-            for i in range(0, len(all_asset_ids), 100):
-                batch = all_asset_ids[i:i + 100]
-                resp = _get_fn(ids=batch)
+            log.debug("CS Discover %s: %d id(s); fetching details…", label, len(all_ids))
+            macs_added = 0
+            for i in range(0, len(all_ids), 100):
+                batch = all_ids[i:i + 100]
+                resp = get_fn(ids=batch)
                 status = resp.get("status_code")
                 if status != 200:
-                    log.warning("CS Discover: get_assets batch %d returned HTTP %s: %s",
-                                i // 100, status,
+                    log.warning("CS Discover %s: get batch %d HTTP %s: %s",
+                                label, i // 100, status,
                                 (resp.get("body") or {}).get("errors"))
                     continue
                 for asset in (resp["body"].get("resources") or []):
-                    asset_id   = asset.get("id", "")
-                    asset_type = asset.get("type", "")
-                    url        = f"{console_url}/discover/assets/{asset_id}"
+                    asset_id = asset.get("id", "")
+                    url      = f"{console_url}/{url_path}/{asset_id}"
                     macs_raw: list[str] = []
                     for nic in (asset.get("network_interfaces") or []):
                         m = nic.get("mac_address") or ""
@@ -450,14 +449,40 @@ def _build_cs_index() -> dict[str, dict]:
                         macs_raw.append(top)
                     added = _add_macs(macs_raw, asset_id, url)
                     if added:
-                        log.debug("CS Discover: asset %s  type=%-12s  hostname=%-30s  +%d MAC(s)",
-                                  asset_id[:16], asset_type,
-                                  (asset.get("hostname") or asset.get("name") or "?")[:30],
-                                  added)
-                    discover_macs += added
+                        log.debug(
+                            "CS Discover %s: asset %s  hostname=%-30s  +%d MAC(s)",
+                            label, asset_id[:16],
+                            (asset.get("hostname") or asset.get("name") or "?")[:30],
+                            added,
+                        )
+                    macs_added += added
 
-            log.info("CS Discover (FEM): %d MAC(s) indexed from %d asset(s)",
-                     discover_macs, len(all_asset_ids))
+            log.info("CS Discover %s: %d MAC(s) from %d asset(s)", label, macs_added, len(all_ids))
+            return macs_added
+
+        # --- unmanaged hosts (sensors on neighbours, no local agent) ---
+        _scroll_and_fetch(
+            "unmanaged-hosts",
+            getattr(discover_svc, "query_hosts",     None) or getattr(discover_svc, "QueryHosts",    None),
+            getattr(discover_svc, "get_hosts",        None) or getattr(discover_svc, "GetHosts",      None),
+            "discover/hosts",
+        )
+
+        # --- IoT / network devices (switches, routers, cameras, etc.) ---
+        _scroll_and_fetch(
+            "iot-hosts",
+            getattr(discover_svc, "query_iot_hosts",  None) or getattr(discover_svc, "QueryIoTHosts", None),
+            getattr(discover_svc, "get_iot_hosts",    None) or getattr(discover_svc, "GetIoTHosts",   None),
+            "discover/iot-assets",
+        )
+
+        # --- legacy combined assets endpoint (older falconpy / older CID) ---
+        _scroll_and_fetch(
+            "assets (legacy)",
+            getattr(discover_svc, "query_assets",    None) or getattr(discover_svc, "QueryAssets",   None),
+            getattr(discover_svc, "get_assets",      None) or getattr(discover_svc, "GetAssets",     None),
+            "discover/assets",
+        )
 
     except Exception as exc:
         log.warning("CS Discover (FEM) API failed: %s", exc, exc_info=True)
