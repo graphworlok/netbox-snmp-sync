@@ -774,22 +774,114 @@ def _print_drift_table(reports: list[DriftReport]) -> None:
 # cs-lookup test command
 # ---------------------------------------------------------------------------
 
+def _cs_direct_mac_lookup(creds: dict, mac_norm: str, verbose: bool) -> Optional[dict]:
+    """
+    Query CrowdStrike directly for a single normalised MAC (12 hex chars, no separators).
+
+    Tries Discover query_hosts with an FQL filter first (FEM-scoped token).
+    Falls back to Hosts query_devices_by_filter if the token has that scope.
+
+    Returns {"id": ..., "url": ..., "hostname": ..., "source": ...} or None.
+    """
+    console_url = "https://falcon.crowdstrike.com"
+
+    # Format MAC as colon-separated for the FQL filter (CrowdStrike stores it that way)
+    mac_colon = ":".join(mac_norm[i:i+2] for i in range(0, 12, 2))
+    log.debug("CS direct lookup: normalised=%s  colon=%s", mac_norm, mac_colon)
+
+    try:
+        from falconpy import Discover
+        discover_svc = Discover(
+            client_id=creds["client_id"],
+            client_secret=creds["client_secret"],
+        )
+        query_fn = getattr(discover_svc, "query_hosts", None) or getattr(discover_svc, "QueryHosts", None)
+        get_fn   = getattr(discover_svc, "get_hosts",   None) or getattr(discover_svc, "GetHosts",   None)
+
+        if query_fn and get_fn:
+            fql = f"network_interfaces.mac_address:'{mac_colon}'"
+            log.debug("CS Discover direct: FQL filter = %s", fql)
+            resp = query_fn(filter=fql, limit=5)
+            status = resp.get("status_code")
+            log.debug("CS Discover direct: query_hosts HTTP %s  resources=%s",
+                      status, (resp.get("body") or {}).get("resources"))
+            if status == 200:
+                ids = (resp["body"].get("resources") or [])
+                if ids:
+                    resp2 = get_fn(ids=ids[:5])
+                    log.debug("CS Discover direct: get_hosts HTTP %s", resp2.get("status_code"))
+                    for asset in (resp2["body"].get("resources") or []):
+                        asset_id = asset.get("id", "")
+                        return {
+                            "id":       asset_id,
+                            "url":      f"{console_url}/discover/hosts/{asset_id}",
+                            "hostname": asset.get("hostname") or asset.get("name") or "",
+                            "source":   "Discover/unmanaged-hosts",
+                            "asset":    asset,
+                        }
+                else:
+                    log.debug("CS Discover direct: no results for MAC %s", mac_colon)
+            else:
+                log.debug("CS Discover direct: query_hosts returned HTTP %s: %s",
+                          status, (resp.get("body") or {}).get("errors"))
+    except Exception as exc:
+        log.debug("CS Discover direct lookup failed: %s", exc, exc_info=True)
+
+    # Fallback: Hosts API (requires Hosts:Read scope, may 403 on FEM-only tokens)
+    try:
+        from falconpy import Hosts
+        hosts_svc = Hosts(
+            client_id=creds["client_id"],
+            client_secret=creds["client_secret"],
+        )
+        fql = f"mac_address:'{mac_colon}'"
+        log.debug("CS Hosts direct: FQL filter = %s", fql)
+        resp = hosts_svc.query_devices_by_filter(filter=fql, limit=5)
+        status = resp.get("status_code")
+        log.debug("CS Hosts direct: query HTTP %s  resources=%s",
+                  status, (resp.get("body") or {}).get("resources"))
+        if status == 200:
+            aids = (resp["body"].get("resources") or [])
+            if aids:
+                resp2 = hosts_svc.get_device_details(ids=aids[:5])
+                for host in (resp2["body"].get("resources") or []):
+                    aid = host.get("device_id", "")
+                    return {
+                        "id":       aid,
+                        "url":      f"{console_url}/host-management/hosts/{aid}",
+                        "hostname": host.get("hostname", ""),
+                        "source":   "Hosts/managed",
+                        "asset":    host,
+                    }
+        elif status == 403:
+            log.debug("CS Hosts direct: HTTP 403 — Hosts:Read scope not available on this token")
+    except Exception as exc:
+        log.debug("CS Hosts direct lookup failed: %s", exc, exc_info=True)
+
+    return None
+
+
 @cli.command("cs-lookup")
 @click.argument("macs", nargs=-1, metavar="MAC...")
 @click.option("--verbose", "-v", is_flag=True,
-              help="Show per-page API debug output while building the index.")
-def cmd_cs_lookup(macs: tuple[str, ...], verbose: bool) -> None:
-    """Look up one or more MAC addresses in the CrowdStrike index.
+              help="Show API debug output for each lookup.")
+@click.option("--full-index", is_flag=True,
+              help="Build the full local MAC index instead of querying per-MAC "
+                   "(useful when checking many MACs from a bulk sync run).")
+def cmd_cs_lookup(macs: tuple[str, ...], verbose: bool, full_index: bool) -> None:
+    """Look up one or more MAC addresses directly in CrowdStrike.
 
-    Builds the full Hosts + Discover (FEM) MAC index then checks each
-    supplied MAC.  Always prints a detailed diagnostic summary so you can
-    see exactly what the API returned and why a MAC did or did not match.
-    Use --verbose to also stream per-page API debug logs while building.
+    By default each MAC is queried individually via FQL filter — fast for
+    spot-checks.  Use --full-index to build the complete local index first
+    (better when checking many MACs at once).
+
+    Always prints token/package diagnostics before querying.
 
     \b
     Examples:
       python main.py cs-lookup aa:bb:cc:dd:ee:ff
       python main.py cs-lookup -v 00-11-22-33-44-55 aabbccddeeff
+      python main.py cs-lookup --full-index aa:bb:cc:dd:ee:ff
     """
     _setup_logging(verbose)
 
@@ -797,17 +889,22 @@ def cmd_cs_lookup(macs: tuple[str, ...], verbose: bool) -> None:
         console.print("[red]Provide at least one MAC address.[/red]")
         return
 
-    # ---- token / package pre-flight ----
+    # ---- pre-flight diagnostics ----
     from pathlib import Path as _Path
     token_path = _Path(getattr(config, "CS_FEM_TOKEN_FILE", "CS_FEM_TOKEN"))
     console.print(f"Token file : [cyan]{token_path}[/cyan]  "
                   + ("[green]exists[/green]" if token_path.exists()
                      else "[red]NOT FOUND[/red]"))
-    if token_path.exists():
-        lines = [l.strip() for l in token_path.read_text().splitlines() if l.strip()]
-        console.print(f"Token lines: {len(lines)}  "
-                      + (f"client_id prefix=[cyan]{lines[1][:8]}…[/cyan]"
-                         if len(lines) >= 2 else "[red]too few lines[/red]"))
+    if not token_path.exists():
+        return
+    lines = [l.strip() for l in token_path.read_text().splitlines() if l.strip()]
+    console.print(f"Token lines: {len(lines)}  "
+                  + (f"client_id prefix=[cyan]{lines[1][:8]}…[/cyan]"
+                     if len(lines) >= 2 else "[red]too few lines[/red]"))
+    if len(lines) < 2:
+        return
+    creds = {"client_secret": lines[0], "client_id": lines[1]}
+
     try:
         import falconpy  # noqa: F401
         console.print("falconpy  : [green]installed[/green]")
@@ -816,44 +913,45 @@ def cmd_cs_lookup(macs: tuple[str, ...], verbose: bool) -> None:
         return
     console.print()
 
-    # ---- build index ----
-    console.print("[bold]Building CrowdStrike MAC index (Hosts + Discover/FEM)…[/bold]")
-    index = _build_cs_index()
-
-    if not index:
-        console.print("\n[yellow]Index is empty.[/yellow]  "
-                      "Run with [bold]--verbose[/bold] to see API responses.")
-        return
-
-    console.print(f"\n[green]Index built: {len(index)} unique MAC(s).[/green]\n")
-
-    # ---- lookup table ----
     t = Table(title="CrowdStrike MAC lookup results", show_lines=True)
-    t.add_column("Input MAC",   style="cyan")
-    t.add_column("Normalised",  style="dim")
-    t.add_column("Result",      justify="center")
+    t.add_column("Input MAC",  style="cyan")
+    t.add_column("Normalised", style="dim")
+    t.add_column("Result",     justify="center")
+    t.add_column("Source")
+    t.add_column("Hostname")
     t.add_column("Asset / AID")
     t.add_column("Falcon URL")
 
-    for raw in macs:
-        norm = raw.lower().replace(":", "").replace("-", "").replace(".", "").strip()
-        hit  = index.get(norm)
-        if hit:
-            t.add_row(
-                raw, norm,
-                "[green]FOUND[/green]",
-                hit.get("aid", ""),
-                hit.get("url", ""),
-            )
-        else:
-            # Show a few nearby keys to help diagnose formatting issues
-            sample = ", ".join(list(index.keys())[:3]) + ("…" if len(index) > 3 else "")
-            t.add_row(
-                raw, norm,
-                "[red]not found[/red]",
-                "",
-                f"[dim]index sample: {sample}[/dim]",
-            )
+    if full_index:
+        console.print("[bold]Building full CrowdStrike MAC index…[/bold]")
+        index = _build_cs_index()
+        console.print(f"[green]Index built: {len(index)} unique MAC(s).[/green]\n")
+        for raw in macs:
+            norm = raw.lower().replace(":", "").replace("-", "").replace(".", "").strip()
+            hit  = index.get(norm)
+            if hit:
+                t.add_row(raw, norm, "[green]FOUND[/green]", "index",
+                          "", hit.get("aid", ""), hit.get("url", ""))
+            else:
+                sample = ", ".join(list(index.keys())[:3]) + ("…" if len(index) > 3 else "")
+                t.add_row(raw, norm, "[red]not found[/red]", "", "",
+                          "", f"[dim]sample: {sample}[/dim]")
+    else:
+        for raw in macs:
+            norm = raw.lower().replace(":", "").replace("-", "").replace(".", "").strip()
+            if len(norm) != 12 or not all(c in "0123456789abcdef" for c in norm):
+                t.add_row(raw, norm, "[red]invalid MAC[/red]", "", "", "", "")
+                continue
+            console.print(f"Querying CrowdStrike for [cyan]{raw}[/cyan]…")
+            hit = _cs_direct_mac_lookup(creds, norm, verbose)
+            if hit:
+                t.add_row(raw, norm, "[green]FOUND[/green]",
+                          hit.get("source", ""),
+                          hit.get("hostname", ""),
+                          hit.get("id", ""),
+                          hit.get("url", ""))
+            else:
+                t.add_row(raw, norm, "[red]not found[/red]", "", "", "", "")
 
     console.print(t)
 
