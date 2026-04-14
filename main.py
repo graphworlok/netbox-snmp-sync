@@ -246,79 +246,203 @@ def _print_integration_status() -> None:
 
 def _build_cs_index() -> dict[str, dict]:
     """
-    Build a MAC → {aid, url} index from CrowdStrike Hosts + Discover APIs.
+    Build a MAC → {aid, url} index from CrowdStrike.
 
-    Reads the CS_FEM_TOKEN credential file.  Returns an empty dict
-    (silently) if the token file is absent or falconpy is not installed,
-    so the MAC sync still works without CrowdStrike configured.
+    Queries two APIs:
+      1. Hosts API  — managed endpoints that have the Falcon sensor installed.
+      2. Discover API (Falcon Exposure Management) — unmanaged endpoints and
+         network devices visible to neighbouring sensors.
+
+    Reads the CS_FEM_TOKEN credential file (two plain-text lines: secret, CID).
+    Returns an empty dict silently if the token file is absent or falconpy is
+    not installed, so MAC sync continues without CrowdStrike data.
     """
     token_path = getattr(config, "CS_FEM_TOKEN_FILE", "CS_FEM_TOKEN")
     from pathlib import Path as _Path
+
     if not _Path(token_path).exists():
-        log.debug("CS_FEM_TOKEN not found — skipping CrowdStrike MAC enrichment")
+        log.debug("CS: token file not found at %s — skipping CrowdStrike enrichment", token_path)
         return {}
 
     try:
         lines = [l.strip() for l in _Path(token_path).read_text().splitlines() if l.strip()]
         if len(lines) < 2:
-            raise ValueError("Expected 2 lines (secret, CID)")
+            raise ValueError(f"Token file {token_path} must have 2 lines (secret, CID); got {len(lines)}")
         creds = {"client_secret": lines[0], "client_id": lines[1]}
-        from falconpy import Hosts
-    except (ImportError, Exception) as exc:
-        log.debug("CrowdStrike MAC index unavailable: %s", exc)
+        log.debug("CS: token file loaded from %s  client_id=%s…", token_path, lines[1][:8])
+    except Exception as exc:
+        log.warning("CS: could not read token file %s: %s", token_path, exc)
         return {}
 
-    console_url = "https://falcon.crowdstrike.com"
-    index: dict[str, dict] = {}
-
     try:
-        hosts = Hosts(
+        from falconpy import Hosts, Discover
+    except ImportError:
+        log.debug("CS: falconpy not installed — skipping CrowdStrike enrichment")
+        return {}
+
+    index: dict[str, dict] = {}
+    console_url = "https://falcon.crowdstrike.com"
+
+    def _norm_mac(raw: str) -> str:
+        return raw.lower().replace("-", "").replace(":", "").replace(".", "").strip()
+
+    def _add_macs(macs_raw: list[str], aid: str, url: str) -> int:
+        added = 0
+        for mac_raw in macs_raw:
+            norm = _norm_mac(mac_raw)
+            if norm and len(norm) == 12 and norm not in index:
+                index[norm] = {"aid": aid, "url": url}
+                added += 1
+        return added
+
+    # ------------------------------------------------------------------ #
+    # 1. Hosts API — sensor-managed endpoints                             #
+    # ------------------------------------------------------------------ #
+    log.debug("CS Hosts: starting scroll of managed devices…")
+    try:
+        hosts_svc = Hosts(
             client_id=creds["client_id"],
             client_secret=creds["client_secret"],
         )
         after = None
         all_aids: list[str] = []
+        page = 0
         while True:
             kwargs: dict = {"limit": 5000}
             if after:
                 kwargs["after"] = after
-            resp = hosts.query_devices_by_filter_scroll(**kwargs)
-            if resp.get("status_code") != 200:
+            resp = hosts_svc.query_devices_by_filter_scroll(**kwargs)
+            status = resp.get("status_code")
+            if status != 200:
+                log.warning("CS Hosts: scroll page %d returned HTTP %s: %s",
+                            page, status,
+                            (resp.get("body") or {}).get("errors"))
                 break
             body  = resp["body"]
             aids  = body.get("resources") or []
             after = (body.get("meta") or {}).get("pagination", {}).get("after")
             all_aids.extend(aids)
+            log.debug("CS Hosts: scroll page %d — %d AID(s) (running total %d)",
+                      page, len(aids), len(all_aids))
+            page += 1
             if not aids or not after:
                 break
 
+        log.debug("CS Hosts: %d AID(s) discovered; fetching device details in batches of 100…",
+                  len(all_aids))
+        hosts_macs = 0
         for i in range(0, len(all_aids), 100):
             batch = all_aids[i:i + 100]
-            resp = hosts.get_device_details(ids=batch)
-            if resp.get("status_code") != 200:
+            resp = hosts_svc.get_device_details(ids=batch)
+            status = resp.get("status_code")
+            if status != 200:
+                log.warning("CS Hosts: get_device_details batch %d returned HTTP %s: %s",
+                            i // 100, status,
+                            (resp.get("body") or {}).get("errors"))
                 continue
             for host in (resp["body"].get("resources") or []):
-                aid = host.get("device_id", "")
-                url = f"{console_url}/host-management/hosts/{aid}"
-                # Collect all MACs from network_interfaces + top-level mac_address
-                macs: list[str] = []
+                aid  = host.get("device_id", "")
+                url  = f"{console_url}/host-management/hosts/{aid}"
+                macs_raw: list[str] = []
                 for nic in (host.get("network_interfaces") or []):
                     m = nic.get("mac_address") or nic.get("mac") or ""
                     if m:
-                        macs.append(m)
-                top_mac = host.get("mac_address", "")
-                if top_mac:
-                    macs.append(top_mac)
-                for mac_raw in macs:
-                    norm = mac_raw.lower().replace("-", "").replace(":", "").replace(".", "")
-                    if norm and norm not in index:
-                        index[norm] = {"aid": aid, "url": url}
+                        macs_raw.append(m)
+                top = host.get("mac_address", "")
+                if top:
+                    macs_raw.append(top)
+                added = _add_macs(macs_raw, aid, url)
+                if added:
+                    log.debug("CS Hosts: AID %s  hostname=%s  +%d MAC(s)",
+                              aid[:16], host.get("hostname", "?"), added)
+                hosts_macs += added
 
-        log.info("CrowdStrike MAC index: %d entries from %d host(s)",
-                 len(index), len(all_aids))
+        log.info("CS Hosts: %d MAC(s) indexed from %d managed host(s)",
+                 hosts_macs, len(all_aids))
+
     except Exception as exc:
-        log.warning("CrowdStrike MAC index build failed: %s", exc)
+        log.warning("CS Hosts API failed: %s", exc, exc_info=True)
 
+    # ------------------------------------------------------------------ #
+    # 2. Discover API — Falcon Exposure Management (FEM)                  #
+    #    Covers unmanaged endpoints and unsupported network devices        #
+    # ------------------------------------------------------------------ #
+    log.debug("CS Discover (FEM): querying unmanaged and unsupported assets…")
+    try:
+        discover_svc = Discover(
+            client_id=creds["client_id"],
+            client_secret=creds["client_secret"],
+        )
+        all_asset_ids: list[str] = []
+        offset = 0
+        page = 0
+        while True:
+            resp = discover_svc.query_assets(
+                filter="type:'unmanaged',type:'unsupported'",
+                limit=5000,
+                offset=offset,
+            )
+            status = resp.get("status_code")
+            if status == 403:
+                log.warning(
+                    "CS Discover: HTTP 403 — Falcon Discover / Exposure Management may "
+                    "not be licensed for this CID. Skipping FEM enrichment."
+                )
+                break
+            if status != 200:
+                log.warning("CS Discover: query_assets page %d returned HTTP %s: %s",
+                            page, status,
+                            (resp.get("body") or {}).get("errors"))
+                break
+            ids   = resp["body"].get("resources") or []
+            total = (resp["body"].get("meta") or {}).get("pagination", {}).get("total", "?")
+            all_asset_ids.extend(ids)
+            log.debug("CS Discover: page %d — %d asset(s) (running total %d / %s)",
+                      page, len(ids), len(all_asset_ids), total)
+            page   += 1
+            offset += len(ids)
+            if not ids or len(ids) < 5000:
+                break
+
+        log.debug("CS Discover: %d asset(s) found; fetching details in batches of 100…",
+                  len(all_asset_ids))
+        discover_macs = 0
+        for i in range(0, len(all_asset_ids), 100):
+            batch = all_asset_ids[i:i + 100]
+            resp = discover_svc.get_assets(ids=batch)
+            status = resp.get("status_code")
+            if status != 200:
+                log.warning("CS Discover: get_assets batch %d returned HTTP %s: %s",
+                            i // 100, status,
+                            (resp.get("body") or {}).get("errors"))
+                continue
+            for asset in (resp["body"].get("resources") or []):
+                asset_id   = asset.get("id", "")
+                asset_type = asset.get("type", "")
+                url        = f"{console_url}/discover/assets/{asset_id}"
+                macs_raw: list[str] = []
+                for nic in (asset.get("network_interfaces") or []):
+                    m = nic.get("mac_address") or ""
+                    if m:
+                        macs_raw.append(m)
+                top = asset.get("mac_address") or asset.get("mac") or ""
+                if top:
+                    macs_raw.append(top)
+                added = _add_macs(macs_raw, asset_id, url)
+                if added:
+                    log.debug("CS Discover: asset %s  type=%-12s  hostname=%-30s  +%d MAC(s)",
+                              asset_id[:16], asset_type,
+                              (asset.get("hostname") or asset.get("name") or "?")[:30],
+                              added)
+                discover_macs += added
+
+        log.info("CS Discover (FEM): %d MAC(s) indexed from %d asset(s)",
+                 discover_macs, len(all_asset_ids))
+
+    except Exception as exc:
+        log.warning("CS Discover (FEM) API failed: %s", exc, exc_info=True)
+
+    log.info("CS MAC index total: %d unique MAC(s) across Hosts + Discover", len(index))
     return index
 
 

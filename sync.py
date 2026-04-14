@@ -630,12 +630,32 @@ def sync_mac_table(
                 totals["skipped"] += len(macs)
                 continue
 
-            # Determine whether this port looks like it has an unmanaged_multimac device:
-            # more than one MAC visible and no CDP/LLDP neighbour on the port.
+            # Skip uplink/trunk interfaces: if a CDP or LLDP neighbour is present
+            # on this port, the MACs in the table are from the downstream network
+            # and should not be stored as learned_macs on this interface.
             has_neighbour = bool(
                 neighbour_ifaces.intersection(_iface_name_variants(if_name))
             )
-            unmanaged_multimac = len(macs) > 1 and not has_neighbour
+            if has_neighbour:
+                log.debug(
+                    "MAC table sync: skipping %s/%s — CDP/LLDP neighbour present "
+                    "(%d MAC(s) suppressed as upstream topology)",
+                    device.display_name, if_name, len(macs),
+                )
+                totals["skipped"] += len(macs)
+                if not dry_run:
+                    # Clear any stale learned_macs and ensure the unmanaged tag is removed
+                    try:
+                        nb.sync_interface_mac_table(nb_iface, if_name, set(), {}, {})
+                    except Exception:
+                        pass
+                    nb.set_interface_uncontrolled_tag(nb_iface, add=False)
+                continue
+
+            # Port has no infrastructure neighbour — track all learned MACs.
+            # Flag as unmanaged-multimac when more than one MAC is visible
+            # (likely a hub, unmanaged switch, or VoIP phone with a data port).
+            unmanaged_multimac = len(macs) > 1
             if unmanaged_multimac:
                 log.info("  UNCONTROLLED device suspected on %s/%s (%d MACs, no CDP/LLDP)",
                          device.display_name, if_name, len(macs))
@@ -643,7 +663,7 @@ def sync_mac_table(
             if dry_run:
                 cs_hits = sum(
                     1 for m in macs
-                    if cs_index and cs_index.get(m.lower().replace(":", ""))
+                    if cs_index and cs_index.get(m.lower().replace(":", "").replace("-", ""))
                 )
                 log.info("  [dry-run] %s/%s  %d MAC(s)%s%s",
                          device.display_name, if_name, len(macs),
