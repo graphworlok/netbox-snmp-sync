@@ -801,18 +801,20 @@ def _cs_direct_mac_lookup(creds: dict, mac_norm: str, verbose: bool) -> Optional
         if query_fn and get_fn:
             # CrowdStrike Discover stores MACs in various formats depending on
             # the field — try every plausible FQL field + format combination.
-            mac_upper  = mac_colon.upper()
-            mac_dash   = "-".join(mac_norm[i:i+2] for i in range(0, 12, 2))
+            # Sample record shows CrowdStrike stores MACs as uppercase-dash: 'F4-DD-06-61-E9-B2'
+            mac_upper_dash = "-".join(mac_norm[i:i+2] for i in range(0, 12, 2)).upper()
+            mac_lower_dash = mac_upper_dash.lower()
+            mac_upper_colon = mac_colon.upper()
             mac_plain  = mac_norm  # no separators
 
             fql_candidates = [
+                f"network_interfaces.mac_address:'{mac_upper_dash}'",   # confirmed format
                 f"network_interfaces.mac_address:'{mac_colon}'",
-                f"network_interfaces.mac_address:'{mac_upper}'",
-                f"network_interfaces.mac_address:'{mac_dash}'",
+                f"network_interfaces.mac_address:'{mac_upper_colon}'",
+                f"network_interfaces.mac_address:'{mac_lower_dash}'",
                 f"network_interfaces.mac_address:'{mac_plain}'",
+                f"mac_address:'{mac_upper_dash}'",
                 f"mac_address:'{mac_colon}'",
-                f"mac_address:'{mac_upper}'",
-                f"mac_address:'{mac_dash}'",
             ]
 
             ids: list[str] = []
