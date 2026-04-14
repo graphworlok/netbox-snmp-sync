@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import re
 import socket
+import time
 from typing import Optional
 
 from pysnmp.hlapi import (
@@ -226,18 +227,33 @@ class SNMPCollector:
     def _get(self, oid: str) -> Optional[object]:
         """GET a single scalar OID, trying credentials in order."""
         for cred in self._cred_list():
+            cred_name = cred.get("name", "?")
             auth = _make_auth(cred)
             transport = _transport(self.host, self.port,
                                    self.timeout, self.retries)
+            log.debug("SNMP GET  %s  oid=%s  cred=%s  timeout=%ds  retries=%d",
+                      self.host, oid, cred_name, self.timeout, self.retries)
+            t0 = time.monotonic()
             error_indication, error_status, _, var_binds = next(
                 getCmd(self._engine, auth, transport, ContextData(),
                        ObjectType(ObjectIdentity(oid)))
             )
-            if error_indication or error_status:
+            elapsed = time.monotonic() - t0
+            if error_indication:
+                log.debug("SNMP GET  %s  oid=%s  cred=%s  FAILED (%.2fs): %s",
+                          self.host, oid, cred_name, elapsed, error_indication)
+                continue
+            if error_status:
+                log.debug("SNMP GET  %s  oid=%s  cred=%s  ERROR (%.2fs): %s",
+                          self.host, oid, cred_name, elapsed, error_status.prettyPrint())
                 continue
             self._working_cred = cred
             val = var_binds[0][1]
-            return val.prettyPrint() if hasattr(val, "prettyPrint") else str(val)
+            result = val.prettyPrint() if hasattr(val, "prettyPrint") else str(val)
+            log.debug("SNMP GET  %s  oid=%s  cred=%s  OK (%.2fs): %r",
+                      self.host, oid, cred_name, elapsed, result[:80] if result else result)
+            return result
+        log.debug("SNMP GET  %s  oid=%s  all credentials exhausted — unreachable", self.host, oid)
         return None
 
     def _walk(self, oid: str) -> dict[str, str]:
@@ -247,17 +263,26 @@ class SNMPCollector:
         """
         results: dict[str, str] = {}
         for cred in self._cred_list():
+            cred_name = cred.get("name", "?")
             auth = _make_auth(cred)
             transport = _transport(self.host, self.port,
                                    self.timeout, self.retries)
+            log.debug("SNMP WALK %s  oid=%s  cred=%s  timeout=%ds  retries=%d",
+                      self.host, oid, cred_name, self.timeout, self.retries)
+            t0 = time.monotonic()
             success = False
+            last_error: str = ""
             for (err_ind, err_status, _, var_binds) in bulkCmd(
                 self._engine, auth, transport, ContextData(),
                 0, 25,
                 ObjectType(ObjectIdentity(oid)),
                 lexicographicMode=False,
             ):
-                if err_ind or err_status:
+                if err_ind:
+                    last_error = str(err_ind)
+                    break
+                if err_status:
+                    last_error = err_status.prettyPrint()
                     break
                 success = True
                 for obj_name, val in var_binds:
@@ -268,9 +293,15 @@ class SNMPCollector:
                         if hasattr(val, "prettyPrint")
                         else str(val)
                     )
+            elapsed = time.monotonic() - t0
             if success:
                 self._working_cred = cred
+                log.debug("SNMP WALK %s  oid=%s  cred=%s  OK (%.2fs): %d row(s)",
+                          self.host, oid, cred_name, elapsed, len(results))
                 return results
+            else:
+                log.debug("SNMP WALK %s  oid=%s  cred=%s  FAILED (%.2fs): %s",
+                          self.host, oid, cred_name, elapsed, last_error or "no data")
         return results
 
     def _cred_list(self) -> list[dict]:

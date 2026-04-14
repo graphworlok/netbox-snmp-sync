@@ -72,6 +72,13 @@ _common_options = [
                  help="Max neighbour-discovery hops (0 = seed only)."),
     click.option("--no-discover", is_flag=True,
                  help="Disable CDP/LLDP-driven auto-discovery."),
+    click.option("--slow", is_flag=True,
+                 help=(
+                     f"Use high-latency SNMP settings "
+                     f"(timeout={config.SNMP_TIMEOUT_SLOW}s, "
+                     f"retries={config.SNMP_RETRIES_SLOW}) "
+                     f"for distant/WAN hosts."
+                 )),
     click.option("--verbose", "-v", is_flag=True),
 ]
 
@@ -594,13 +601,17 @@ def cli():
 
 @cli.command("drift")
 @_add_options(_common_options)
-def cmd_drift(ips, ip_file, depth, no_discover, verbose):
+def cmd_drift(ips, ip_file, depth, no_discover, slow, verbose):
     """Show differences between SNMP data and NetBox (no changes written)."""
     _setup_logging(verbose)
     _print_integration_status()
 
     if no_discover:
         config.AUTO_DISCOVER_NEIGHBORS = False
+    if slow:
+        config.SNMP_TIMEOUT = config.SNMP_TIMEOUT_SLOW
+        config.SNMP_RETRIES = config.SNMP_RETRIES_SLOW
+        console.print(f"[yellow]--slow: SNMP timeout={config.SNMP_TIMEOUT}s  retries={config.SNMP_RETRIES}[/yellow]")
 
     seed = _collect_seed_ips(ips, ip_file)
     disc = discovery.run(seed, max_depth=depth)
@@ -636,13 +647,17 @@ def cmd_drift(ips, ip_file, depth, no_discover, verbose):
               help="Compute changes but do not write to NetBox.")
 @click.option("--no-create", is_flag=True,
               help="Only update existing objects, do not create new ones.")
-def cmd_sync(ips, ip_file, depth, no_discover, verbose, dry_run, no_create):
+def cmd_sync(ips, ip_file, depth, no_discover, slow, verbose, dry_run, no_create):
     """Sync SNMP data into NetBox (creates and updates)."""
     _setup_logging(verbose)
     _print_integration_status()
 
     if no_discover:
         config.AUTO_DISCOVER_NEIGHBORS = False
+    if slow:
+        config.SNMP_TIMEOUT = config.SNMP_TIMEOUT_SLOW
+        config.SNMP_RETRIES = config.SNMP_RETRIES_SLOW
+        console.print(f"[yellow]--slow: SNMP timeout={config.SNMP_TIMEOUT}s  retries={config.SNMP_RETRIES}[/yellow]")
 
     seed = _collect_seed_ips(ips, ip_file)
     disc = discovery.run(seed, max_depth=depth)

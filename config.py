@@ -52,6 +52,11 @@ SNMP_PORT = 161
 SNMP_TIMEOUT = 5     # seconds per attempt
 SNMP_RETRIES = 2     # retries after timeout
 
+# --- High-latency / distant host settings (activated with --slow) ---
+# Use these when polling devices over slow WAN links or high-RTT paths.
+SNMP_TIMEOUT_SLOW = 30   # seconds per attempt
+SNMP_RETRIES_SLOW = 3    # retries after timeout
+
 # --- Concurrency ---
 # Number of devices to poll via SNMP simultaneously during discovery.
 SNMP_WORKERS = 10
