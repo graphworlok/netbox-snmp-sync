@@ -619,10 +619,26 @@ def sync_mac_table(
 
         log.info("MAC table sync: %s  %d interface(s)", device.display_name, len(by_iface))
 
-        # Collect CS hits found on any interface of this device so we can
-        # write the Falcon URL directly onto the NetBox device object.
+        # Check the device's own interface MAC addresses against CS.
+        # These are the switch's hardware MACs, not learned/forwarded MACs.
         # Keyed by nb_dev.id → first CS hit found {aid, url}.
         device_cs_hits: dict[int, dict] = {}
+        if cs_index:
+            for iface in device.interfaces:
+                if not iface.mac_address:
+                    continue
+                hit = cs_index.get(_norm(iface.mac_address))
+                if not hit:
+                    continue
+                # Resolve which NetBox device this interface belongs to
+                nb_dev = iface_device_map.get(iface.name)
+                if nb_dev is None:
+                    continue
+                if nb_dev.id not in device_cs_hits:
+                    device_cs_hits[nb_dev.id] = {"nb_dev": nb_dev, **hit}
+                    log.debug("CS device match: %s own MAC %s → %s",
+                              getattr(nb_dev, "name", nb_dev.id),
+                              iface.mac_address, hit.get("url", ""))
 
         for if_name, macs in by_iface.items():
             nb_dev = iface_device_map.get(if_name)
@@ -659,16 +675,6 @@ def sync_mac_table(
                         pass
                     nb.set_interface_uncontrolled_tag(nb_iface, add=False)
                 continue
-
-            # Accumulate CS hits for device-level enrichment
-            if cs_index and nb_dev.id not in device_cs_hits:
-                for mac in macs:
-                    hit = cs_index.get(_norm(mac))
-                    if hit:
-                        device_cs_hits[nb_dev.id] = {"nb_dev": nb_dev, **hit}
-                        log.debug("MAC table sync: CS hit for %s via MAC %s → %s",
-                                  getattr(nb_dev, "name", nb_dev.id), mac, hit.get("url", ""))
-                        break
 
             # Port has no infrastructure neighbour — track all learned MACs.
             unmanaged_multimac = len(macs) > 1
