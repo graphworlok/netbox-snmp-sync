@@ -392,6 +392,7 @@ def _build_cs_index() -> dict[str, dict]:
             query_fn,
             get_fn,
             url_path: str,
+            page_limit: int = 100,
         ) -> int:
             """Generic scroll + details fetch for one Discover asset class."""
             if query_fn is None or get_fn is None:
@@ -402,7 +403,7 @@ def _build_cs_index() -> dict[str, dict]:
             offset = 0
             page = 0
             while True:
-                resp = query_fn(limit=5000, offset=offset)
+                resp = query_fn(limit=page_limit, offset=offset)
                 status = resp.get("status_code")
                 if status == 403:
                     log.info(
@@ -422,7 +423,7 @@ def _build_cs_index() -> dict[str, dict]:
                           label, page, len(ids), len(all_ids), total)
                 page   += 1
                 offset += len(ids)
-                if not ids or len(ids) < 5000:
+                if not ids or len(ids) < page_limit:
                     break
 
             log.debug("CS Discover %s: %d id(s); fetching details…", label, len(all_ids))
