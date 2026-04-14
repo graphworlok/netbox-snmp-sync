@@ -373,71 +373,91 @@ def _build_cs_index() -> dict[str, dict]:
             client_id=creds["client_id"],
             client_secret=creds["client_secret"],
         )
-        all_asset_ids: list[str] = []
-        offset = 0
-        page = 0
-        while True:
-            resp = discover_svc.query_assets(
-                filter="type:'unmanaged',type:'unsupported'",
-                limit=5000,
-                offset=offset,
+
+        # Resolve method names — falconpy exposes both snake_case and PascalCase
+        # depending on version; try snake_case first, fall back to PascalCase.
+        _query_fn = (
+            getattr(discover_svc, "query_assets", None)
+            or getattr(discover_svc, "QueryAssets", None)
+        )
+        _get_fn = (
+            getattr(discover_svc, "get_assets", None)
+            or getattr(discover_svc, "GetAssets", None)
+        )
+
+        if not _query_fn or not _get_fn:
+            available = [m for m in dir(discover_svc) if not m.startswith("_")]
+            log.warning(
+                "CS Discover: could not find query_assets/get_assets on the Discover "
+                "service class.  Available methods: %s",
+                available,
             )
-            status = resp.get("status_code")
-            if status == 403:
-                log.warning(
-                    "CS Discover: HTTP 403 — Falcon Discover / Exposure Management may "
-                    "not be licensed for this CID. Skipping FEM enrichment."
+        else:
+            all_asset_ids: list[str] = []
+            offset = 0
+            page = 0
+            while True:
+                resp = _query_fn(
+                    filter="type:'unmanaged',type:'unsupported'",
+                    limit=5000,
+                    offset=offset,
                 )
-                break
-            if status != 200:
-                log.warning("CS Discover: query_assets page %d returned HTTP %s: %s",
-                            page, status,
-                            (resp.get("body") or {}).get("errors"))
-                break
-            ids   = resp["body"].get("resources") or []
-            total = (resp["body"].get("meta") or {}).get("pagination", {}).get("total", "?")
-            all_asset_ids.extend(ids)
-            log.debug("CS Discover: page %d — %d asset(s) (running total %d / %s)",
-                      page, len(ids), len(all_asset_ids), total)
-            page   += 1
-            offset += len(ids)
-            if not ids or len(ids) < 5000:
-                break
+                status = resp.get("status_code")
+                if status == 403:
+                    log.warning(
+                        "CS Discover: HTTP 403 — Falcon Discover / Exposure Management may "
+                        "not be licensed for this CID. Skipping FEM enrichment."
+                    )
+                    break
+                if status != 200:
+                    log.warning("CS Discover: query page %d returned HTTP %s: %s",
+                                page, status,
+                                (resp.get("body") or {}).get("errors"))
+                    break
+                ids   = resp["body"].get("resources") or []
+                total = (resp["body"].get("meta") or {}).get("pagination", {}).get("total", "?")
+                all_asset_ids.extend(ids)
+                log.debug("CS Discover: page %d — %d asset(s) (running total %d / %s)",
+                          page, len(ids), len(all_asset_ids), total)
+                page   += 1
+                offset += len(ids)
+                if not ids or len(ids) < 5000:
+                    break
 
-        log.debug("CS Discover: %d asset(s) found; fetching details in batches of 100…",
-                  len(all_asset_ids))
-        discover_macs = 0
-        for i in range(0, len(all_asset_ids), 100):
-            batch = all_asset_ids[i:i + 100]
-            resp = discover_svc.get_assets(ids=batch)
-            status = resp.get("status_code")
-            if status != 200:
-                log.warning("CS Discover: get_assets batch %d returned HTTP %s: %s",
-                            i // 100, status,
-                            (resp.get("body") or {}).get("errors"))
-                continue
-            for asset in (resp["body"].get("resources") or []):
-                asset_id   = asset.get("id", "")
-                asset_type = asset.get("type", "")
-                url        = f"{console_url}/discover/assets/{asset_id}"
-                macs_raw: list[str] = []
-                for nic in (asset.get("network_interfaces") or []):
-                    m = nic.get("mac_address") or ""
-                    if m:
-                        macs_raw.append(m)
-                top = asset.get("mac_address") or asset.get("mac") or ""
-                if top:
-                    macs_raw.append(top)
-                added = _add_macs(macs_raw, asset_id, url)
-                if added:
-                    log.debug("CS Discover: asset %s  type=%-12s  hostname=%-30s  +%d MAC(s)",
-                              asset_id[:16], asset_type,
-                              (asset.get("hostname") or asset.get("name") or "?")[:30],
-                              added)
-                discover_macs += added
+            log.debug("CS Discover: %d asset(s) found; fetching details in batches of 100…",
+                      len(all_asset_ids))
+            discover_macs = 0
+            for i in range(0, len(all_asset_ids), 100):
+                batch = all_asset_ids[i:i + 100]
+                resp = _get_fn(ids=batch)
+                status = resp.get("status_code")
+                if status != 200:
+                    log.warning("CS Discover: get_assets batch %d returned HTTP %s: %s",
+                                i // 100, status,
+                                (resp.get("body") or {}).get("errors"))
+                    continue
+                for asset in (resp["body"].get("resources") or []):
+                    asset_id   = asset.get("id", "")
+                    asset_type = asset.get("type", "")
+                    url        = f"{console_url}/discover/assets/{asset_id}"
+                    macs_raw: list[str] = []
+                    for nic in (asset.get("network_interfaces") or []):
+                        m = nic.get("mac_address") or ""
+                        if m:
+                            macs_raw.append(m)
+                    top = asset.get("mac_address") or asset.get("mac") or ""
+                    if top:
+                        macs_raw.append(top)
+                    added = _add_macs(macs_raw, asset_id, url)
+                    if added:
+                        log.debug("CS Discover: asset %s  type=%-12s  hostname=%-30s  +%d MAC(s)",
+                                  asset_id[:16], asset_type,
+                                  (asset.get("hostname") or asset.get("name") or "?")[:30],
+                                  added)
+                    discover_macs += added
 
-        log.info("CS Discover (FEM): %d MAC(s) indexed from %d asset(s)",
-                 discover_macs, len(all_asset_ids))
+            log.info("CS Discover (FEM): %d MAC(s) indexed from %d asset(s)",
+                     discover_macs, len(all_asset_ids))
 
     except Exception as exc:
         log.warning("CS Discover (FEM) API failed: %s", exc, exc_info=True)
