@@ -297,6 +297,25 @@ class NetBoxClient:
                     log.error("Could not remove unmanaged-multimac tag from interface %s: %s",
                               iface.id, exc)
 
+    def set_device_tag(self, device: object, slug: str, add: bool) -> None:
+        """Add or remove a tag (by slug) on a NetBox device object."""
+        current_slugs = [t.slug for t in (getattr(device, "tags", None) or [])]
+        has_tag = slug in current_slugs
+        if add and not has_tag:
+            log.info("TAG %s: device %s", slug, getattr(device, "name", device.id))
+            if not self.dry_run:
+                try:
+                    device.update({"tags": [{"slug": s} for s in current_slugs] + [{"slug": slug}]})
+                except Exception as exc:
+                    log.error("Could not add tag %s to device %s: %s", slug, device.id, exc)
+        elif not add and has_tag:
+            log.info("UNTAG %s: device %s", slug, getattr(device, "name", device.id))
+            if not self.dry_run:
+                try:
+                    device.update({"tags": [{"slug": s} for s in current_slugs if s != slug]})
+                except Exception as exc:
+                    log.error("Could not remove tag %s from device %s: %s", slug, device.id, exc)
+
     # ------------------------------------------------------------------
     # MAC addresses (native dcim.mac_addresses — NetBox 4.1+)
     # ------------------------------------------------------------------

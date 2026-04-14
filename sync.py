@@ -582,9 +582,13 @@ def sync_mac_table(
     Returns totals: {"updated": N, "unchanged": N, "skipped": N}.
     """
     nb.ensure_mac_address_fields()
+    nb.ensure_crowdstrike_device_fields()
     oui = OuiLookup.from_config()
 
     totals: dict[str, int] = {"updated": 0, "unchanged": 0, "skipped": 0}
+
+    def _norm(mac: str) -> str:
+        return mac.lower().replace(":", "").replace("-", "").replace(".", "")
 
     for device in devices:
         if not device.mac_table:
@@ -615,6 +619,11 @@ def sync_mac_table(
 
         log.info("MAC table sync: %s  %d interface(s)", device.display_name, len(by_iface))
 
+        # Collect CS hits found on any interface of this device so we can
+        # write the Falcon URL directly onto the NetBox device object.
+        # Keyed by nb_dev.id → first CS hit found {aid, url}.
+        device_cs_hits: dict[int, dict] = {}
+
         for if_name, macs in by_iface.items():
             nb_dev = iface_device_map.get(if_name)
             if nb_dev is None:
@@ -644,7 +653,6 @@ def sync_mac_table(
                 )
                 totals["skipped"] += len(macs)
                 if not dry_run:
-                    # Clear any stale learned_macs and ensure the unmanaged tag is removed
                     try:
                         nb.sync_interface_mac_table(nb_iface, if_name, set(), {}, {})
                     except Exception:
@@ -652,19 +660,24 @@ def sync_mac_table(
                     nb.set_interface_uncontrolled_tag(nb_iface, add=False)
                 continue
 
+            # Accumulate CS hits for device-level enrichment
+            if cs_index and nb_dev.id not in device_cs_hits:
+                for mac in macs:
+                    hit = cs_index.get(_norm(mac))
+                    if hit:
+                        device_cs_hits[nb_dev.id] = {"nb_dev": nb_dev, **hit}
+                        log.debug("MAC table sync: CS hit for %s via MAC %s → %s",
+                                  getattr(nb_dev, "name", nb_dev.id), mac, hit.get("url", ""))
+                        break
+
             # Port has no infrastructure neighbour — track all learned MACs.
-            # Flag as unmanaged-multimac when more than one MAC is visible
-            # (likely a hub, unmanaged switch, or VoIP phone with a data port).
             unmanaged_multimac = len(macs) > 1
             if unmanaged_multimac:
                 log.info("  UNCONTROLLED device suspected on %s/%s (%d MACs, no CDP/LLDP)",
                          device.display_name, if_name, len(macs))
 
             if dry_run:
-                cs_hits = sum(
-                    1 for m in macs
-                    if cs_index and cs_index.get(m.lower().replace(":", "").replace("-", ""))
-                )
+                cs_hits = sum(1 for m in macs if cs_index and cs_index.get(_norm(m)))
                 log.info("  [dry-run] %s/%s  %d MAC(s)%s%s",
                          device.display_name, if_name, len(macs),
                          f"  {cs_hits} CrowdStrike match(es)" if cs_hits else "",
@@ -683,6 +696,24 @@ def sync_mac_table(
                 totals["skipped"] += 1
 
             nb.set_interface_uncontrolled_tag(nb_iface, add=unmanaged_multimac)
+
+        # Write CS Falcon URL + tag directly onto each matched NetBox device
+        for dev_id, hit in device_cs_hits.items():
+            nb_dev   = hit["nb_dev"]
+            cs_url   = hit.get("url", "")
+            existing = getattr(nb_dev, "custom_fields", {}) or {}
+            if existing.get("cs_falcon_url") == cs_url:
+                log.debug("MAC table sync: CS URL unchanged on %s", getattr(nb_dev, "name", dev_id))
+                continue
+            log.info("MAC table sync: writing CS Falcon URL to device %s → %s",
+                     getattr(nb_dev, "name", dev_id), cs_url)
+            if not dry_run:
+                try:
+                    nb_dev.update({"custom_fields": {"cs_falcon_url": cs_url}})
+                    nb.set_device_tag(nb_dev, "crowdstrike", add=True)
+                except Exception as exc:
+                    log.error("Could not update CS URL on device %s: %s",
+                              getattr(nb_dev, "name", dev_id), exc)
 
     return totals
 
