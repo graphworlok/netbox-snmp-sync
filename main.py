@@ -132,6 +132,117 @@ def _parallel_drift(
     return [r for r in reports if r is not None]
 
 
+# ---------------------------------------------------------------------------
+# Integration status
+# ---------------------------------------------------------------------------
+
+def _print_integration_status() -> None:
+    """Print a status table showing which integrations are configured and available."""
+    from pathlib import Path as _Path
+
+    t = Table(title="Integration status", show_lines=True)
+    t.add_column("Integration")
+    t.add_column("Status")
+    t.add_column("Detail")
+
+    # --- NetBox ---
+    nb_url   = getattr(config, "NETBOX_URL",   "")
+    nb_token = getattr(config, "NETBOX_TOKEN", "")
+    placeholder_url   = not nb_url   or nb_url   == "https://netbox.example.com"
+    placeholder_token = not nb_token or nb_token == "YOUR_NETBOX_API_TOKEN"
+    if placeholder_url or placeholder_token:
+        t.add_row("NetBox", "[red]NOT CONFIGURED[/red]",
+                  "Set NETBOX_URL and NETBOX_TOKEN in config.py")
+    else:
+        t.add_row("NetBox", "[green]configured[/green]", nb_url)
+
+    # --- SNMP credentials ---
+    creds = getattr(config, "SNMP_CREDENTIALS", [])
+    real_creds = [
+        c for c in creds
+        if c.get("version") == 2 and c.get("community") not in ("public", "private")
+        or c.get("version") == 3 and c.get("auth_key", "") not in ("", "YOUR_AUTH_KEY")
+    ]
+    v2 = sum(1 for c in creds if c.get("version") == 2)
+    v3 = sum(1 for c in creds if c.get("version") == 3)
+    if not creds:
+        t.add_row("SNMP", "[red]NOT CONFIGURED[/red]", "No credentials in SNMP_CREDENTIALS")
+    elif not real_creds and creds:
+        t.add_row("SNMP", "[yellow]default only[/yellow]",
+                  f"{v2} v2c (public/private), {v3} v3 placeholder — update config.py")
+    else:
+        t.add_row("SNMP", "[green]configured[/green]",
+                  f"{v2} v2c credential(s), {v3} v3 credential(s)")
+
+    # --- OUI database ---
+    oui_file = getattr(config, "OUI_FILE", "")
+    if isinstance(oui_file, (list, tuple)):
+        oui_paths = [_Path(p) for p in oui_file if p]
+    else:
+        oui_paths = [_Path(oui_file)] if oui_file else []
+    missing = [str(p) for p in oui_paths if not p.exists()]
+    if not oui_paths:
+        t.add_row("OUI lookup", "[yellow]disabled[/yellow]",
+                  "Set OUI_FILE in config.py to enable vendor resolution")
+    elif missing:
+        t.add_row("OUI lookup", "[red]file(s) missing[/red]", ", ".join(missing))
+    else:
+        t.add_row("OUI lookup", "[green]configured[/green]",
+                  ", ".join(str(p) for p in oui_paths))
+
+    # --- CrowdStrike ---
+    cs_token_path = _Path(getattr(config, "CS_FEM_TOKEN_FILE", "CS_FEM_TOKEN"))
+    cs_pkg = False
+    try:
+        import falconpy  # noqa: F401
+        cs_pkg = True
+    except ImportError:
+        pass
+    if not cs_pkg and not cs_token_path.exists():
+        t.add_row("CrowdStrike", "[dim]not configured[/dim]",
+                  "Install crowdstrike-falconpy and create CS_FEM_TOKEN to enable")
+    elif not cs_pkg:
+        t.add_row("CrowdStrike", "[yellow]package missing[/yellow]",
+                  "pip install crowdstrike-falconpy")
+    elif not cs_token_path.exists():
+        t.add_row("CrowdStrike", "[yellow]token missing[/yellow]",
+                  f"{cs_token_path} not found")
+    else:
+        try:
+            cred_keys = set(json.loads(cs_token_path.read_text()).keys())
+            if {"client_id", "client_secret"} <= cred_keys:
+                t.add_row("CrowdStrike", "[green]configured[/green]",
+                          f"{cs_token_path}")
+            else:
+                t.add_row("CrowdStrike", "[red]invalid token file[/red]",
+                          "Missing client_id or client_secret")
+        except Exception as exc:
+            t.add_row("CrowdStrike", "[red]token file error[/red]", str(exc))
+
+    # --- Cisco Meraki ---
+    meraki_key = getattr(config, "MERAKI_API_KEY", "")
+    meraki_pkg = False
+    try:
+        import meraki  # noqa: F401
+        meraki_pkg = True
+    except ImportError:
+        pass
+    if not meraki_key and not meraki_pkg:
+        t.add_row("Meraki", "[dim]not configured[/dim]",
+                  "Set MERAKI_API_KEY in config.py and install meraki SDK to enable")
+    elif not meraki_pkg:
+        t.add_row("Meraki", "[yellow]package missing[/yellow]",
+                  "pip install meraki")
+    elif not meraki_key:
+        t.add_row("Meraki", "[yellow]no API key[/yellow]",
+                  "Set MERAKI_API_KEY in config.py")
+    else:
+        t.add_row("Meraki", "[green]configured[/green]", "API key set")
+
+    console.print(t)
+    console.print()
+
+
 def _build_cs_index() -> dict[str, dict]:
     """
     Build a MAC → {aid, url} index from CrowdStrike Hosts + Discover APIs.
@@ -222,6 +333,7 @@ def cli():
 def cmd_drift(ips, ip_file, depth, no_discover, verbose):
     """Show differences between SNMP data and NetBox (no changes written)."""
     _setup_logging(verbose)
+    _print_integration_status()
 
     if no_discover:
         config.AUTO_DISCOVER_NEIGHBORS = False
@@ -263,6 +375,7 @@ def cmd_drift(ips, ip_file, depth, no_discover, verbose):
 def cmd_sync(ips, ip_file, depth, no_discover, verbose, dry_run, no_create):
     """Sync SNMP data into NetBox (creates and updates)."""
     _setup_logging(verbose)
+    _print_integration_status()
 
     if no_discover:
         config.AUTO_DISCOVER_NEIGHBORS = False
