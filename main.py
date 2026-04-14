@@ -799,31 +799,54 @@ def _cs_direct_mac_lookup(creds: dict, mac_norm: str, verbose: bool) -> Optional
         get_fn   = getattr(discover_svc, "get_hosts",   None) or getattr(discover_svc, "GetHosts",   None)
 
         if query_fn and get_fn:
-            fql = f"network_interfaces.mac_address:'{mac_colon}'"
-            log.debug("CS Discover direct: FQL filter = %s", fql)
-            resp = query_fn(filter=fql, limit=5)
-            status = resp.get("status_code")
-            log.debug("CS Discover direct: query_hosts HTTP %s  resources=%s",
-                      status, (resp.get("body") or {}).get("resources"))
-            if status == 200:
-                ids = (resp["body"].get("resources") or [])
-                if ids:
-                    resp2 = get_fn(ids=ids[:5])
-                    log.debug("CS Discover direct: get_hosts HTTP %s", resp2.get("status_code"))
-                    for asset in (resp2["body"].get("resources") or []):
-                        asset_id = asset.get("id", "")
-                        return {
-                            "id":       asset_id,
-                            "url":      f"{console_url}/discover/hosts/{asset_id}",
-                            "hostname": asset.get("hostname") or asset.get("name") or "",
-                            "source":   "Discover/unmanaged-hosts",
-                            "asset":    asset,
-                        }
-                else:
-                    log.debug("CS Discover direct: no results for MAC %s", mac_colon)
+            # CrowdStrike Discover stores MACs in various formats depending on
+            # the field — try every plausible FQL field + format combination.
+            mac_upper  = mac_colon.upper()
+            mac_dash   = "-".join(mac_norm[i:i+2] for i in range(0, 12, 2))
+            mac_plain  = mac_norm  # no separators
+
+            fql_candidates = [
+                f"network_interfaces.mac_address:'{mac_colon}'",
+                f"network_interfaces.mac_address:'{mac_upper}'",
+                f"network_interfaces.mac_address:'{mac_dash}'",
+                f"network_interfaces.mac_address:'{mac_plain}'",
+                f"mac_address:'{mac_colon}'",
+                f"mac_address:'{mac_upper}'",
+                f"mac_address:'{mac_dash}'",
+            ]
+
+            ids: list[str] = []
+            matched_fql = ""
+            for fql in fql_candidates:
+                log.debug("CS Discover direct: trying FQL = %s", fql)
+                resp = query_fn(filter=fql, limit=5)
+                status = resp.get("status_code")
+                found = (resp.get("body") or {}).get("resources") or []
+                log.debug("CS Discover direct: HTTP %s  resources=%s", status, found)
+                if status == 200 and found:
+                    ids = found
+                    matched_fql = fql
+                    break
+                elif status not in (200, 400):
+                    log.debug("CS Discover direct: unexpected HTTP %s: %s",
+                              status, (resp.get("body") or {}).get("errors"))
+
+            if ids:
+                log.debug("CS Discover direct: matched via FQL '%s'", matched_fql)
+                resp2 = get_fn(ids=ids[:5])
+                log.debug("CS Discover direct: get_hosts HTTP %s", resp2.get("status_code"))
+                for asset in (resp2["body"].get("resources") or []):
+                    asset_id = asset.get("id", "")
+                    return {
+                        "id":       asset_id,
+                        "url":      f"{console_url}/discover/hosts/{asset_id}",
+                        "hostname": asset.get("hostname") or asset.get("name") or "",
+                        "source":   f"Discover/unmanaged-hosts [{matched_fql}]",
+                        "asset":    asset,
+                    }
             else:
-                log.debug("CS Discover direct: query_hosts returned HTTP %s: %s",
-                          status, (resp.get("body") or {}).get("errors"))
+                log.debug("CS Discover direct: no results for MAC %s (tried %d FQL variants)",
+                          mac_norm, len(fql_candidates))
     except Exception as exc:
         log.debug("CS Discover direct lookup failed: %s", exc, exc_info=True)
 
