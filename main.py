@@ -27,6 +27,8 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import json
+
 import click
 from rich.console import Console
 from rich.table import Table
@@ -130,6 +132,82 @@ def _parallel_drift(
     return [r for r in reports if r is not None]
 
 
+def _build_cs_index() -> dict[str, dict]:
+    """
+    Build a MAC → {aid, url} index from CrowdStrike Hosts + Discover APIs.
+
+    Reads the CS_FEM_TOKEN credential file.  Returns an empty dict
+    (silently) if the token file is absent or falconpy is not installed,
+    so the MAC sync still works without CrowdStrike configured.
+    """
+    token_path = getattr(config, "CS_FEM_TOKEN_FILE", "CS_FEM_TOKEN")
+    from pathlib import Path as _Path
+    if not _Path(token_path).exists():
+        log.debug("CS_FEM_TOKEN not found — skipping CrowdStrike MAC enrichment")
+        return {}
+
+    try:
+        creds = json.loads(_Path(token_path).read_text())
+        from falconpy import Hosts
+    except (ImportError, Exception) as exc:
+        log.debug("CrowdStrike MAC index unavailable: %s", exc)
+        return {}
+
+    console_url = creds.get("console_url", "https://falcon.crowdstrike.com").rstrip("/")
+    index: dict[str, dict] = {}
+
+    try:
+        hosts = Hosts(
+            client_id=creds["client_id"],
+            client_secret=creds["client_secret"],
+            base_url=creds.get("base_url", "https://api.crowdstrike.com"),
+        )
+        after = None
+        all_aids: list[str] = []
+        while True:
+            kwargs: dict = {"limit": 5000}
+            if after:
+                kwargs["after"] = after
+            resp = hosts.query_devices_by_filter_scroll(**kwargs)
+            if resp.get("status_code") != 200:
+                break
+            body  = resp["body"]
+            aids  = body.get("resources") or []
+            after = (body.get("meta") or {}).get("pagination", {}).get("after")
+            all_aids.extend(aids)
+            if not aids or not after:
+                break
+
+        for i in range(0, len(all_aids), 100):
+            batch = all_aids[i:i + 100]
+            resp = hosts.get_device_details(ids=batch)
+            if resp.get("status_code") != 200:
+                continue
+            for host in (resp["body"].get("resources") or []):
+                aid = host.get("device_id", "")
+                url = f"{console_url}/host-management/hosts/{aid}"
+                # Collect all MACs from network_interfaces + top-level mac_address
+                macs: list[str] = []
+                for nic in (host.get("network_interfaces") or []):
+                    m = nic.get("mac_address") or nic.get("mac") or ""
+                    if m:
+                        macs.append(m)
+                top_mac = host.get("mac_address", "")
+                if top_mac:
+                    macs.append(top_mac)
+                for mac_raw in macs:
+                    norm = mac_raw.lower().replace("-", "").replace(":", "").replace(".", "")
+                    if norm and norm not in index:
+                        index[norm] = {"aid": aid, "url": url}
+
+        log.info("CrowdStrike MAC index: %d entries from %d host(s)",
+                 len(index), len(all_aids))
+    except Exception as exc:
+        log.warning("CrowdStrike MAC index build failed: %s", exc)
+
+    return index
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -157,6 +235,8 @@ def cmd_drift(ips, ip_file, depth, no_discover, verbose):
 
     _print_drift_table(reports)
 
+    nb = NetBoxClient(config.NETBOX_URL, config.NETBOX_TOKEN, dry_run=True)
+
     # Cable report — show what would be created (dry-run, so nothing written)
     cable_count = sync_mod.sync_cables(
         disc.collected, nb, create_missing=True, dry_run=True
@@ -165,7 +245,8 @@ def cmd_drift(ips, ip_file, depth, no_discover, verbose):
         console.print(f"\n[cyan]{cable_count} cable(s) would be created from CDP/LLDP data.[/cyan]")
 
     # MAC table report
-    mac_counts = sync_mod.sync_mac_table(disc.collected, nb, dry_run=True)
+    cs_index = _build_cs_index()
+    mac_counts = sync_mod.sync_mac_table(disc.collected, nb, dry_run=True, cs_index=cs_index)
     if mac_counts.get("updated"):
         console.print(
             f"[cyan]{mac_counts['updated']} interface(s) would have their "
@@ -215,9 +296,10 @@ def cmd_sync(ips, ip_file, depth, no_discover, verbose, dry_run, no_create):
         dry_run=dry_run,
     )
 
-    # MAC table sync
+    # MAC table sync — enrich with CrowdStrike data if available
     console.print("\n[bold]MAC table sync…[/bold]")
-    mac_counts = sync_mod.sync_mac_table(disc.collected, nb, dry_run=dry_run)
+    cs_index = _build_cs_index()
+    mac_counts = sync_mod.sync_mac_table(disc.collected, nb, dry_run=dry_run, cs_index=cs_index)
 
     if dry_run:
         console.print(

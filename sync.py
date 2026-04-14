@@ -560,21 +560,31 @@ def sync_mac_table(
     devices: list[DeviceInfo],
     nb: NetBoxClient,
     dry_run: bool = False,
+    cs_index: Optional[dict[str, dict]] = None,
 ) -> dict[str, int]:
     """
-    Sync per-interface MAC address tables to native NetBox dcim.mac_addresses objects.
+    Sync per-interface bridge forwarding table MACs into NetBox.
 
-    For stacked devices, interfaces are resolved against the individual member
-    devices rather than a single parent device.
+    MACs are stored in the 'learned_macs' JSON custom field on each
+    interface — NOT as dcim.mac_addresses objects (those represent the
+    port's own hardware address, not downstream learned addresses).
 
-    Returns totals: {"created": N, "refreshed": N, "stale": N, "unchanged": N, "skipped": N}.
+    Each entry: {mac, vendor, cs_aid, cs_url}.  CrowdStrike fields are
+    populated when *cs_index* is supplied — a dict keyed by normalised
+    MAC (lowercase hex, no separators) → {"aid": str, "url": str}.
+
+    For stacked devices, interfaces are resolved against the individual
+    member devices rather than a single parent device.
+
+    Also applies / removes the 'unmanaged-multimac' tag: set when >1 MAC
+    is learned on a port that has no CDP/LLDP neighbour.
+
+    Returns totals: {"updated": N, "unchanged": N, "skipped": N}.
     """
     nb.ensure_mac_address_fields()
     oui = OuiLookup.from_config()
 
-    totals: dict[str, int] = {
-        "created": 0, "refreshed": 0, "stale": 0, "unchanged": 0, "skipped": 0,
-    }
+    totals: dict[str, int] = {"updated": 0, "unchanged": 0, "skipped": 0}
 
     for device in devices:
         if not device.mac_table:
@@ -631,21 +641,28 @@ def sync_mac_table(
                          device.display_name, if_name, len(macs))
 
             if dry_run:
-                log.info("  [dry-run] %s/%s  %d MAC(s)%s",
+                cs_hits = sum(
+                    1 for m in macs
+                    if cs_index and cs_index.get(m.lower().replace(":", ""))
+                )
+                log.info("  [dry-run] %s/%s  %d MAC(s)%s%s",
                          device.display_name, if_name, len(macs),
-                         "  [unmanaged_multimac]" if unmanaged_multimac else "")
-                totals["created"] += len(macs)
+                         f"  {cs_hits} CrowdStrike match(es)" if cs_hits else "",
+                         "  [unmanaged-multimac]" if unmanaged_multimac else "")
+                totals["updated"] += 1
                 continue
 
             try:
-                counts = nb.sync_interface_macs(nb_iface.id, if_name, macs, vendor_map)
+                counts = nb.sync_interface_mac_table(
+                    nb_iface, if_name, macs, vendor_map, cs_index
+                )
                 for k, v in counts.items():
                     totals[k] += v
             except Exception as exc:
-                log.error("MAC sync failed %s/%s: %s", device.display_name, if_name, exc)
-                totals["skipped"] += len(macs)
+                log.error("MAC table sync failed %s/%s: %s", device.display_name, if_name, exc)
+                totals["skipped"] += 1
 
-            nb.set_interface_unmanaged_multimac_tag(nb_iface, add=unmanaged_multimac)
+            nb.set_interface_uncontrolled_tag(nb_iface, add=unmanaged_multimac)
 
     return totals
 

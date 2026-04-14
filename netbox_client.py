@@ -323,8 +323,19 @@ class NetBoxClient:
         },
     ]
 
+    _IFACE_MAC_TABLE_FIELD: dict = {
+        "name":         "learned_macs",
+        "label":        "Learned MACs",
+        "type":         "json",
+        "object_types": ["dcim.interface"],
+        "description":  "Bridge forwarding table MACs learned on this interface. "
+                        "Each entry: {mac, vendor, cs_aid, cs_url}. "
+                        "Populated by netbox-snmp-sync.",
+        "required":     False,
+    }
+
     def ensure_mac_address_fields(self) -> None:
-        """Create required tags and MAC address custom fields if absent."""
+        """Create required tags and custom fields if absent."""
         for tag in (self._STALE_TAG, self._UNCONTROLLED_TAG):
             if not self.nb.extras.tags.get(slug=tag["slug"]):
                 log.info("Creating tag: %s", tag["slug"])
@@ -334,9 +345,9 @@ class NetBoxClient:
                     except Exception as exc:
                         log.error("Could not create tag %s: %s", tag["slug"], exc)
 
-        for field in self._MAC_CUSTOM_FIELDS:
+        for field in self._MAC_CUSTOM_FIELDS + [self._IFACE_MAC_TABLE_FIELD]:
             if not self.nb.extras.custom_fields.get(name=field["name"]):
-                log.info("Creating custom field: %s on dcim.macaddress", field["name"])
+                log.info("Creating custom field: %s", field["name"])
                 if not self.dry_run:
                     try:
                         self.nb.extras.custom_fields.create(field)
@@ -410,6 +421,77 @@ class NetBoxClient:
                     counts["stale"] += 1
 
         return counts
+
+    def sync_interface_mac_table(
+        self,
+        iface: object,
+        if_name: str,
+        snmp_macs: set[str],
+        vendor_map: Optional[dict[str, str]] = None,
+        cs_index: Optional[dict[str, dict]] = None,
+    ) -> dict[str, int]:
+        """
+        Store bridge forwarding table MACs in the 'learned_macs' JSON custom
+        field on *iface* rather than as dcim.mac_addresses objects.
+
+        Each entry in the JSON array:
+          {
+            "mac":    "aa:bb:cc:dd:ee:ff",
+            "vendor": "Vendor Inc.",        (from OUI lookup, may be "")
+            "cs_aid": "abc123...",          (CrowdStrike AID, if found)
+            "cs_url": "https://falcon..."   (Falcon host page URL, if found)
+          }
+
+        *cs_index* is an optional dict keyed by normalised MAC (lowercase,
+        no separators) → {"aid": str, "url": str}, built by the caller from
+        CrowdStrike data.
+
+        Returns {"updated": 0|1, "unchanged": 0|1}.
+        """
+        import json as _json
+
+        vendor_map = vendor_map or {}
+        cs_index   = cs_index   or {}
+
+        entries = []
+        for mac in sorted(snmp_macs):
+            norm = mac.lower().replace(":", "")
+            cs   = cs_index.get(norm, {})
+            entries.append({
+                "mac":    mac,
+                "vendor": vendor_map.get(mac, ""),
+                "cs_aid": cs.get("aid", ""),
+                "cs_url": cs.get("url", ""),
+            })
+
+        new_json = _json.dumps(entries, separators=(",", ":"))
+
+        existing_cf = getattr(iface, "custom_fields", {}) or {}
+        old_raw     = existing_cf.get("learned_macs")
+        old_json    = _json.dumps(old_raw, separators=(",", ":")) if old_raw is not None else "null"
+
+        # Compare normalised to avoid spurious updates
+        try:
+            old_norm = _json.dumps(_json.loads(old_json),  separators=(",", ":"), sort_keys=True)
+            new_norm = _json.dumps(_json.loads(new_json),  separators=(",", ":"), sort_keys=True)
+        except Exception:
+            old_norm, new_norm = old_json, new_json
+
+        if old_norm == new_norm:
+            return {"updated": 0, "unchanged": 1}
+
+        cs_count = sum(1 for e in entries if e["cs_aid"])
+        log.info("UPDATE learned_macs: %s/%s  %d MAC(s), %d with CrowdStrike",
+                 if_name, getattr(iface, "id", "?"), len(entries), cs_count)
+
+        if not self.dry_run:
+            try:
+                iface.update({"custom_fields": {"learned_macs": entries}})
+            except Exception as exc:
+                log.error("Could not update learned_macs on %s: %s", if_name, exc)
+                return {"updated": 0, "unchanged": 0}
+
+        return {"updated": 1, "unchanged": 0}
 
     # ------------------------------------------------------------------
     # IP addresses
