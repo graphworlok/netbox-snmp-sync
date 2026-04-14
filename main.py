@@ -634,6 +634,94 @@ def _print_drift_table(reports: list[DriftReport]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# cs-lookup test command
+# ---------------------------------------------------------------------------
+
+@cli.command("cs-lookup")
+@click.argument("macs", nargs=-1, metavar="MAC...")
+@click.option("--verbose", "-v", is_flag=True,
+              help="Show per-page API debug output while building the index.")
+def cmd_cs_lookup(macs: tuple[str, ...], verbose: bool) -> None:
+    """Look up one or more MAC addresses in the CrowdStrike index.
+
+    Builds the full Hosts + Discover (FEM) MAC index then checks each
+    supplied MAC.  Always prints a detailed diagnostic summary so you can
+    see exactly what the API returned and why a MAC did or did not match.
+    Use --verbose to also stream per-page API debug logs while building.
+
+    \b
+    Examples:
+      python main.py cs-lookup aa:bb:cc:dd:ee:ff
+      python main.py cs-lookup -v 00-11-22-33-44-55 aabbccddeeff
+    """
+    _setup_logging(verbose)
+
+    if not macs:
+        console.print("[red]Provide at least one MAC address.[/red]")
+        return
+
+    # ---- token / package pre-flight ----
+    from pathlib import Path as _Path
+    token_path = _Path(getattr(config, "CS_FEM_TOKEN_FILE", "CS_FEM_TOKEN"))
+    console.print(f"Token file : [cyan]{token_path}[/cyan]  "
+                  + ("[green]exists[/green]" if token_path.exists()
+                     else "[red]NOT FOUND[/red]"))
+    if token_path.exists():
+        lines = [l.strip() for l in token_path.read_text().splitlines() if l.strip()]
+        console.print(f"Token lines: {len(lines)}  "
+                      + (f"client_id prefix=[cyan]{lines[1][:8]}…[/cyan]"
+                         if len(lines) >= 2 else "[red]too few lines[/red]"))
+    try:
+        import falconpy  # noqa: F401
+        console.print("falconpy  : [green]installed[/green]")
+    except ImportError:
+        console.print("falconpy  : [red]NOT installed[/red]  (pip install crowdstrike-falconpy)")
+        return
+    console.print()
+
+    # ---- build index ----
+    console.print("[bold]Building CrowdStrike MAC index (Hosts + Discover/FEM)…[/bold]")
+    index = _build_cs_index()
+
+    if not index:
+        console.print("\n[yellow]Index is empty.[/yellow]  "
+                      "Run with [bold]--verbose[/bold] to see API responses.")
+        return
+
+    console.print(f"\n[green]Index built: {len(index)} unique MAC(s).[/green]\n")
+
+    # ---- lookup table ----
+    t = Table(title="CrowdStrike MAC lookup results", show_lines=True)
+    t.add_column("Input MAC",   style="cyan")
+    t.add_column("Normalised",  style="dim")
+    t.add_column("Result",      justify="center")
+    t.add_column("Asset / AID")
+    t.add_column("Falcon URL")
+
+    for raw in macs:
+        norm = raw.lower().replace(":", "").replace("-", "").replace(".", "").strip()
+        hit  = index.get(norm)
+        if hit:
+            t.add_row(
+                raw, norm,
+                "[green]FOUND[/green]",
+                hit.get("aid", ""),
+                hit.get("url", ""),
+            )
+        else:
+            # Show a few nearby keys to help diagnose formatting issues
+            sample = ", ".join(list(index.keys())[:3]) + ("…" if len(index) > 3 else "")
+            t.add_row(
+                raw, norm,
+                "[red]not found[/red]",
+                "",
+                f"[dim]index sample: {sample}[/dim]",
+            )
+
+    console.print(t)
+
+
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     cli()
