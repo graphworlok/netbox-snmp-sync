@@ -41,6 +41,7 @@ from models import ChangeKind, DriftReport
 from netbox_client import NetBoxClient
 
 console = Console()
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -209,13 +210,13 @@ def _print_integration_status() -> None:
                   f"{cs_token_path} not found")
     else:
         try:
-            cred_keys = set(json.loads(cs_token_path.read_text()).keys())
-            if {"client_id", "client_secret"} <= cred_keys:
+            lines = [l.strip() for l in cs_token_path.read_text().splitlines() if l.strip()]
+            if len(lines) >= 2:
                 t.add_row("CrowdStrike", "[green]configured[/green]",
                           f"{cs_token_path}")
             else:
                 t.add_row("CrowdStrike", "[red]invalid token file[/red]",
-                          "Missing client_id or client_secret")
+                          "Expected 2 lines: client_secret on line 1, client_id on line 2")
         except Exception as exc:
             t.add_row("CrowdStrike", "[red]token file error[/red]", str(exc))
 
@@ -258,20 +259,22 @@ def _build_cs_index() -> dict[str, dict]:
         return {}
 
     try:
-        creds = json.loads(_Path(token_path).read_text())
+        lines = [l.strip() for l in _Path(token_path).read_text().splitlines() if l.strip()]
+        if len(lines) < 2:
+            raise ValueError("Expected 2 lines (secret, CID)")
+        creds = {"client_secret": lines[0], "client_id": lines[1]}
         from falconpy import Hosts
     except (ImportError, Exception) as exc:
         log.debug("CrowdStrike MAC index unavailable: %s", exc)
         return {}
 
-    console_url = creds.get("console_url", "https://falcon.crowdstrike.com").rstrip("/")
+    console_url = "https://falcon.crowdstrike.com"
     index: dict[str, dict] = {}
 
     try:
         hosts = Hosts(
             client_id=creds["client_id"],
             client_secret=creds["client_secret"],
-            base_url=creds.get("base_url", "https://api.crowdstrike.com"),
         )
         after = None
         all_aids: list[str] = []
