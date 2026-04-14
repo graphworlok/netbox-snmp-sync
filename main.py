@@ -847,6 +847,25 @@ def _cs_direct_mac_lookup(creds: dict, mac_norm: str, verbose: bool) -> Optional
             else:
                 log.debug("CS Discover direct: no results for MAC %s (tried %d FQL variants)",
                           mac_norm, len(fql_candidates))
+
+                # Fetch one sample record (no filter) to show actual MAC field structure
+                log.debug("CS Discover direct: fetching 1 sample record to inspect MAC field names…")
+                sample_resp = query_fn(limit=1)
+                sample_ids  = (sample_resp.get("body") or {}).get("resources") or []
+                if sample_ids:
+                    sample_detail = get_fn(ids=sample_ids)
+                    for rec in ((sample_detail.get("body") or {}).get("resources") or []):
+                        # Log only MAC-related fields to avoid dumping PII
+                        mac_fields = {
+                            k: v for k, v in rec.items()
+                            if "mac" in k.lower() or k == "network_interfaces"
+                        }
+                        log.debug(
+                            "CS Discover sample record MAC fields: %s",
+                            mac_fields,
+                        )
+                else:
+                    log.debug("CS Discover direct: no records exist in Discover for this CID")
     except Exception as exc:
         log.debug("CS Discover direct lookup failed: %s", exc, exc_info=True)
 
