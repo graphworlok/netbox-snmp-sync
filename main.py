@@ -79,6 +79,8 @@ _common_options = [
                      f"retries={config.SNMP_RETRIES_SLOW}) "
                      f"for distant/WAN hosts."
                  )),
+    click.option("--cs-refresh", is_flag=True,
+                 help="Force a full re-fetch of CrowdStrike asset data, ignoring the local cache."),
     click.option("--verbose", "-v", is_flag=True),
 ]
 
@@ -251,343 +253,316 @@ def _print_integration_status() -> None:
     console.print()
 
 
-def _build_cs_index() -> dict[str, dict]:
-    """
-    Build a MAC → {aid, url} index from CrowdStrike.
+# ---------------------------------------------------------------------------
+# CrowdStrike asset cache helpers
+# ---------------------------------------------------------------------------
 
-    Queries two APIs:
-      1. Hosts API  — managed endpoints that have the Falcon sensor installed.
-      2. Discover API (Falcon Exposure Management) — unmanaged endpoints and
-         network devices visible to neighbouring sensors.
-
-    Reads the CS_FEM_TOKEN credential file (two plain-text lines: secret, CID).
-    Returns an empty dict silently if the token file is absent or falconpy is
-    not installed, so MAC sync continues without CrowdStrike data.
-    """
-    token_path = getattr(config, "CS_FEM_TOKEN_FILE", "CS_FEM_TOKEN")
+def _cs_creds() -> Optional[dict]:
+    """Load and return CS credentials from token file, or None if unavailable."""
     from pathlib import Path as _Path
-
-    if not _Path(token_path).exists():
-        log.debug("CS: token file not found at %s — skipping CrowdStrike enrichment", token_path)
-        return {}
-
+    token_path = _Path(getattr(config, "CS_FEM_TOKEN_FILE", "CS_FEM_TOKEN"))
+    if not token_path.exists():
+        log.debug("CS: token file not found at %s", token_path)
+        return None
     try:
-        lines = [l.strip() for l in _Path(token_path).read_text().splitlines() if l.strip()]
+        lines = [l.strip() for l in token_path.read_text().splitlines() if l.strip()]
         if len(lines) < 2:
-            raise ValueError(f"Token file {token_path} must have 2 lines (secret, CID); got {len(lines)}")
-        creds = {"client_secret": lines[0], "client_id": lines[1]}
+            raise ValueError(f"Expected 2 lines, got {len(lines)}")
         log.debug("CS: token file loaded from %s  client_id=%s…", token_path, lines[1][:8])
+        return {"client_secret": lines[0], "client_id": lines[1]}
     except Exception as exc:
         log.warning("CS: could not read token file %s: %s", token_path, exc)
-        return {}
+        return None
+
+
+def _cs_cache_path() -> Optional["Path"]:
+    from pathlib import Path as _Path
+    p = getattr(config, "CS_CACHE_FILE", "cs_asset_cache.json")
+    return _Path(p) if p else None
+
+
+def _cs_cache_is_fresh() -> bool:
+    """Return True if the cache file exists and is younger than CS_CACHE_MAX_AGE."""
+    import time as _time
+    path = _cs_cache_path()
+    if not path or not path.exists():
+        return False
+    age = _time.time() - path.stat().st_mtime
+    max_age = getattr(config, "CS_CACHE_MAX_AGE", 86400)
+    if age < max_age:
+        log.debug("CS cache: fresh (age %.0fs / max %ds) — %s", age, max_age, path)
+        return True
+    log.debug("CS cache: stale (age %.0fs / max %ds) — will refresh", age, max_age)
+    return False
+
+
+def _cs_cache_load() -> Optional[dict]:
+    """Load and return the raw cache dict, or None on failure."""
+    path = _cs_cache_path()
+    if not path or not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        log.debug("CS cache: loaded %d Hosts + %d Discover records from %s",
+                  len(data.get("hosts", [])),
+                  len(data.get("discover_hosts", [])),
+                  path)
+        return data
+    except Exception as exc:
+        log.warning("CS cache: failed to load %s: %s", path, exc)
+        return None
+
+
+def _cs_cache_save(data: dict) -> None:
+    """Write the raw asset data dict to the cache file."""
+    import time as _time
+    path = _cs_cache_path()
+    if not path:
+        return
+    data["cached_at"] = _time.time()
+    try:
+        path.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
+        total = sum(len(v) for k, v in data.items() if isinstance(v, list))
+        log.info("CS cache: saved %d total records to %s", total, path)
+    except Exception as exc:
+        log.warning("CS cache: could not write %s: %s", path, exc)
+
+
+def _cs_fetch_assets(creds: dict) -> dict:
+    """
+    Fetch all raw asset records from CrowdStrike APIs.
+
+    Returns a dict:
+      {
+        "hosts":          [...],   # Hosts API (sensor-managed)
+        "discover_hosts": [...],   # Discover query_hosts (unmanaged)
+      }
+
+    Pagination bug fix: stop when len(fetched_ids) >= declared total,
+    not just when a page returns fewer than page_limit items (the API
+    sometimes returns exactly page_limit on the final page).
+    """
+    console_url = "https://falcon.crowdstrike.com"
+    result: dict[str, list] = {"hosts": [], "discover_hosts": []}
 
     try:
         from falconpy import Hosts, Discover
     except ImportError:
-        log.debug("CS: falconpy not installed — skipping CrowdStrike enrichment")
-        return {}
+        log.debug("CS: falconpy not installed")
+        return result
 
-    index: dict[str, dict] = {}
-    console_url = "https://falcon.crowdstrike.com"
+    def _scroll_ids(label: str, query_fn, page_limit: int = 100) -> list[str]:
+        """Page through a query endpoint, return all IDs. Respects declared total."""
+        if query_fn is None:
+            log.debug("CS %s: query function not available", label)
+            return []
+        all_ids: list[str] = []
+        offset = 0
+        page   = 0
+        total  = None   # populated from first response
+        while True:
+            resp   = query_fn(limit=page_limit, offset=offset)
+            status = resp.get("status_code")
+            if status == 403:
+                log.info("CS %s: HTTP 403 — scope not available for this token", label)
+                return all_ids
+            if status != 200:
+                log.warning("CS %s: query page %d HTTP %s: %s",
+                            label, page, status,
+                            (resp.get("body") or {}).get("errors"))
+                return all_ids
+            body    = resp["body"]
+            ids     = body.get("resources") or []
+            meta    = (body.get("meta") or {}).get("pagination") or {}
+            if total is None:
+                total = meta.get("total")
+                log.debug("CS %s: %d total asset(s) declared by API", label, total or "?")
+            all_ids.extend(ids)
+            log.debug("CS %s: page %d — %d id(s) fetched (running %d / %s)",
+                      label, page, len(ids), len(all_ids), total or "?")
+            page   += 1
+            offset += len(ids)
+            # Stop when: no more IDs, short page, OR we've reached the declared total
+            if not ids:
+                break
+            if total is not None and len(all_ids) >= total:
+                log.debug("CS %s: reached declared total (%d) — stopping", label, total)
+                break
+            if len(ids) < page_limit:
+                break
+        log.info("CS %s: %d id(s) collected", label, len(all_ids))
+        return all_ids
 
-    def _norm_mac(raw: str) -> str:
-        return raw.lower().replace("-", "").replace(":", "").replace(".", "").strip()
+    def _fetch_details(label: str, get_fn, ids: list[str], batch_size: int = 100) -> list[dict]:
+        """Fetch full detail records for a list of IDs in batches."""
+        if not ids or get_fn is None:
+            return []
+        records: list[dict] = []
+        for i in range(0, len(ids), batch_size):
+            batch  = ids[i:i + batch_size]
+            resp   = get_fn(ids=batch)
+            status = resp.get("status_code")
+            if status != 200:
+                log.warning("CS %s: get_details batch %d HTTP %s: %s",
+                            label, i // batch_size, status,
+                            (resp.get("body") or {}).get("errors"))
+                continue
+            batch_records = (resp["body"].get("resources") or [])
+            records.extend(batch_records)
+            log.debug("CS %s: fetched detail batch %d — %d record(s) (running %d)",
+                      label, i // batch_size, len(batch_records), len(records))
+        log.info("CS %s: %d full record(s) fetched", label, len(records))
+        return records
 
-    def _add_macs(macs_raw: list[str], aid: str, url: str) -> int:
-        added = 0
-        for mac_raw in macs_raw:
-            norm = _norm_mac(mac_raw)
-            if norm and len(norm) == 12 and norm not in index:
-                index[norm] = {"aid": aid, "url": url}
-                added += 1
-        return added
-
-    # ------------------------------------------------------------------ #
-    # 1. Hosts API — sensor-managed endpoints                             #
-    #    403 means the credential only has FEM scope — that is fine,      #
-    #    Discover will cover unmanaged assets.                             #
-    # ------------------------------------------------------------------ #
-    log.debug("CS Hosts: starting scroll of managed devices…")
+    # ---- 1. Hosts API (sensor-managed) ----
+    log.debug("CS Hosts: starting scroll…")
     try:
-        hosts_svc = Hosts(
-            client_id=creds["client_id"],
-            client_secret=creds["client_secret"],
-        )
-        after = None
+        hosts_svc = Hosts(client_id=creds["client_id"], client_secret=creds["client_secret"])
+        # Hosts uses cursor-based scroll, not offset
         all_aids: list[str] = []
-        page = 0
+        after = None
+        page  = 0
+        total = None
         while True:
             kwargs: dict = {"limit": 5000}
             if after:
                 kwargs["after"] = after
-            resp = hosts_svc.query_devices_by_filter_scroll(**kwargs)
+            resp   = hosts_svc.query_devices_by_filter_scroll(**kwargs)
             status = resp.get("status_code")
             if status == 403:
-                log.info(
-                    "CS Hosts: HTTP 403 — credential does not have Hosts:Read scope "
-                    "(FEM-only token is fine; Discover will cover unmanaged assets)"
-                )
+                log.info("CS Hosts: HTTP 403 — Hosts:Read scope not available (FEM-only token)")
                 break
             if status != 200:
-                log.warning("CS Hosts: scroll page %d returned HTTP %s: %s",
-                            page, status,
-                            (resp.get("body") or {}).get("errors"))
+                log.warning("CS Hosts: scroll page %d HTTP %s: %s",
+                            page, status, (resp.get("body") or {}).get("errors"))
                 break
             body  = resp["body"]
             aids  = body.get("resources") or []
-            after = (body.get("meta") or {}).get("pagination", {}).get("after")
+            meta  = (body.get("meta") or {}).get("pagination") or {}
+            after = meta.get("after")
+            if total is None:
+                total = meta.get("total")
+                log.debug("CS Hosts: %d total AID(s) declared", total or "?")
             all_aids.extend(aids)
-            log.debug("CS Hosts: scroll page %d — %d AID(s) (running total %d)",
-                      page, len(aids), len(all_aids))
+            log.debug("CS Hosts: scroll page %d — %d AID(s) (running %d / %s)",
+                      page, len(aids), len(all_aids), total or "?")
             page += 1
             if not aids or not after:
                 break
-
-        log.debug("CS Hosts: %d AID(s) discovered; fetching device details in batches of 100…",
-                  len(all_aids))
-        hosts_macs = 0
-        for i in range(0, len(all_aids), 100):
-            batch = all_aids[i:i + 100]
-            resp = hosts_svc.get_device_details(ids=batch)
-            status = resp.get("status_code")
-            if status != 200:
-                log.warning("CS Hosts: get_device_details batch %d returned HTTP %s: %s",
-                            i // 100, status,
-                            (resp.get("body") or {}).get("errors"))
-                continue
-            for host in (resp["body"].get("resources") or []):
-                aid  = host.get("device_id", "")
-                url  = f"{console_url}/host-management/hosts/{aid}"
-                macs_raw: list[str] = []
-                for nic in (host.get("network_interfaces") or []):
-                    m = nic.get("mac_address") or nic.get("mac") or ""
-                    if m:
-                        macs_raw.append(m)
-                top = host.get("mac_address", "")
-                if top:
-                    macs_raw.append(top)
-                added = _add_macs(macs_raw, aid, url)
-                if added:
-                    log.debug("CS Hosts: AID %s  hostname=%s  +%d MAC(s)",
-                              aid[:16], host.get("hostname", "?"), added)
-                hosts_macs += added
-
-        log.info("CS Hosts: %d MAC(s) indexed from %d managed host(s)",
-                 hosts_macs, len(all_aids))
-
+            if total is not None and len(all_aids) >= total:
+                log.debug("CS Hosts: reached declared total (%d) — stopping", total)
+                break
+        result["hosts"] = _fetch_details(
+            "Hosts", hosts_svc.get_device_details, all_aids
+        )
     except Exception as exc:
         log.warning("CS Hosts API failed: %s", exc, exc_info=True)
 
-    # ------------------------------------------------------------------ #
-    # 2. Discover API — Falcon Exposure Management (FEM)                  #
-    #                                                                      #
-    # This version of falconpy exposes two asset classes separately:       #
-    #   query_hosts / get_hosts       — unmanaged endpoints                #
-    #   query_iot_hosts / get_iot_hosts — IoT / network devices            #
-    # (older builds used query_assets/get_assets for both; newer builds   #
-    #  split them — we try both styles and skip any that 403/fail)         #
-    # ------------------------------------------------------------------ #
-    log.debug("CS Discover (FEM): querying unmanaged hosts and IoT/network devices…")
+    # ---- 2. Discover — unmanaged hosts (FEM scope) ----
+    log.debug("CS Discover: starting scroll of unmanaged hosts…")
     try:
-        discover_svc = Discover(
-            client_id=creds["client_id"],
-            client_secret=creds["client_secret"],
-        )
-
-        def _scroll_and_fetch(
-            label: str,
-            query_fn,
-            get_fn,
-            url_path: str,
-            page_limit: int = 100,
-        ) -> int:
-            """Generic scroll + details fetch for one Discover asset class."""
-            if query_fn is None or get_fn is None:
-                log.debug("CS Discover: %s — methods not available on this falconpy build", label)
-                return 0
-
-            all_ids: list[str] = []
-            offset = 0
-            page = 0
-            while True:
-                resp = query_fn(limit=page_limit, offset=offset)
-                status = resp.get("status_code")
-                if status == 403:
-                    log.info(
-                        "CS Discover %s: HTTP 403 — may not be licensed or scoped for this CID",
-                        label,
-                    )
-                    return 0
-                if status != 200:
-                    log.warning("CS Discover %s: query page %d HTTP %s: %s",
-                                label, page, status,
-                                (resp.get("body") or {}).get("errors"))
-                    return 0
-                ids   = resp["body"].get("resources") or []
-                total = (resp["body"].get("meta") or {}).get("pagination", {}).get("total", "?")
-                all_ids.extend(ids)
-                log.debug("CS Discover %s: page %d — %d id(s) (total %d / %s)",
-                          label, page, len(ids), len(all_ids), total)
-                page   += 1
-                offset += len(ids)
-                if not ids or len(ids) < page_limit:
-                    break
-
-            log.debug("CS Discover %s: %d id(s); fetching details…", label, len(all_ids))
-            macs_added = 0
-            for i in range(0, len(all_ids), 100):
-                batch = all_ids[i:i + 100]
-                resp = get_fn(ids=batch)
-                status = resp.get("status_code")
-                if status != 200:
-                    log.warning("CS Discover %s: get batch %d HTTP %s: %s",
-                                label, i // 100, status,
-                                (resp.get("body") or {}).get("errors"))
-                    continue
-                resources = resp["body"].get("resources") or []
-                if resources and macs_added == 0 and i == 0:
-                    # Log the keys of the first asset so we can verify field names
-                    log.debug("CS Discover %s: first asset keys: %s",
-                              label, sorted(resources[0].keys()))
-                for asset in resources:
-                    asset_id = asset.get("id", "")
-                    url      = f"{console_url}/{url_path}/{asset_id}"
-                    macs_raw: list[str] = []
-                    for nic in (asset.get("network_interfaces") or []):
-                        m = nic.get("mac_address") or nic.get("mac") or ""
-                        if m:
-                            macs_raw.append(m)
-                    for field in ("mac_address", "mac", "primary_mac"):
-                        v = asset.get(field) or ""
-                        if v:
-                            macs_raw.append(v)
-                            break
-                    added = _add_macs(macs_raw, asset_id, url)
-                    if added:
-                        log.debug(
-                            "CS Discover %s: asset %s  hostname=%-30s  +%d MAC(s)",
-                            label, asset_id[:16],
-                            (asset.get("hostname") or asset.get("name") or "?")[:30],
-                            added,
-                        )
-                    else:
-                        log.debug("CS Discover %s: asset %s  hostname=%-30s  no MACs found",
-                                  label, asset_id[:16],
-                                  (asset.get("hostname") or asset.get("name") or "?")[:30])
-                    macs_added += added
-
-            log.info("CS Discover %s: %d MAC(s) from %d asset(s)", label, macs_added, len(all_ids))
-            return macs_added
-
-        # Unmanaged hosts — endpoints/assets visible to neighbouring sensors
-        # but without their own Falcon agent. Uses FEM scope (no Hosts:Read needed).
-        _scroll_and_fetch(
-            "unmanaged-hosts",
-            getattr(discover_svc, "query_hosts", None) or getattr(discover_svc, "QueryHosts", None),
-            getattr(discover_svc, "get_hosts",   None) or getattr(discover_svc, "GetHosts",   None),
-            "discover/hosts",
-        )
-
+        discover_svc = Discover(client_id=creds["client_id"], client_secret=creds["client_secret"])
+        query_fn = (getattr(discover_svc, "query_hosts", None)
+                    or getattr(discover_svc, "QueryHosts", None))
+        get_fn   = (getattr(discover_svc, "get_hosts", None)
+                    or getattr(discover_svc, "GetHosts", None))
+        if query_fn and get_fn:
+            ids = _scroll_ids("Discover/unmanaged-hosts", query_fn, page_limit=100)
+            result["discover_hosts"] = _fetch_details("Discover/unmanaged-hosts", get_fn, ids)
+            if result["discover_hosts"]:
+                log.debug("CS Discover: first record keys: %s",
+                          sorted(result["discover_hosts"][0].keys()))
+        else:
+            log.debug("CS Discover: query_hosts/get_hosts not available on this falconpy build")
     except Exception as exc:
-        log.warning("CS Discover (FEM) API failed: %s", exc, exc_info=True)
+        log.warning("CS Discover API failed: %s", exc, exc_info=True)
 
-    # ------------------------------------------------------------------ #
-    # 3. ExposureManagement API — external attack surface / FEM           #
-    #    IoT and network devices are accessible here with FEM scope        #
-    # ------------------------------------------------------------------ #
-    log.debug("CS ExposureManagement: querying network/IoT assets…")
-    try:
-        from falconpy import ExposureManagement
-        fem_svc = ExposureManagement(
-            client_id=creds["client_id"],
-            client_secret=creds["client_secret"],
-        )
-        log.debug("CS ExposureManagement: available methods: %s",
-                  [m for m in dir(fem_svc) if not m.startswith("_")])
+    return result
 
-        def _fem_scroll_and_fetch(label: str, query_fn, get_fn, url_path: str, page_limit: int = 100) -> int:
-            if query_fn is None or get_fn is None:
-                log.debug("CS ExposureManagement: %s — method not available", label)
-                return 0
-            all_ids: list[str] = []
-            offset = 0
-            page = 0
-            while True:
-                resp = query_fn(limit=page_limit, offset=offset)
-                status = resp.get("status_code")
-                if status == 403:
-                    log.info("CS ExposureManagement %s: HTTP 403 — check FEM API scope", label)
-                    return 0
-                if status != 200:
-                    log.warning("CS ExposureManagement %s: query page %d HTTP %s: %s",
-                                label, page, status,
-                                (resp.get("body") or {}).get("errors"))
-                    return 0
-                ids   = resp["body"].get("resources") or []
-                total = (resp["body"].get("meta") or {}).get("pagination", {}).get("total", "?")
-                all_ids.extend(ids)
-                log.debug("CS ExposureManagement %s: page %d — %d id(s) (total %d / %s)",
-                          label, page, len(ids), len(all_ids), total)
-                page   += 1
-                offset += len(ids)
-                if not ids or len(ids) < page_limit:
-                    break
 
-            log.debug("CS ExposureManagement %s: %d id(s); fetching details…", label, len(all_ids))
-            macs_added = 0
-            for i in range(0, len(all_ids), 100):
-                batch = all_ids[i:i + 100]
-                resp = get_fn(ids=batch)
-                status = resp.get("status_code")
-                if status != 200:
-                    log.warning("CS ExposureManagement %s: get batch %d HTTP %s: %s",
-                                label, i // 100, status,
-                                (resp.get("body") or {}).get("errors"))
-                    continue
-                for asset in (resp["body"].get("resources") or []):
-                    asset_id = asset.get("id", "")
-                    url      = f"{console_url}/{url_path}/{asset_id}"
-                    macs_raw: list[str] = []
-                    for nic in (asset.get("network_interfaces") or []):
-                        m = nic.get("mac_address") or ""
-                        if m:
-                            macs_raw.append(m)
-                    top = asset.get("mac_address") or asset.get("mac") or ""
-                    if top:
-                        macs_raw.append(top)
-                    added = _add_macs(macs_raw, asset_id, url)
-                    if added:
-                        log.debug("CS ExposureManagement %s: asset %s  hostname=%-30s  +%d MAC(s)",
-                                  label, asset_id[:16],
-                                  (asset.get("hostname") or asset.get("name") or "?")[:30],
-                                  added)
-                    macs_added += added
+def _build_cs_index_from_assets(asset_data: dict) -> dict[str, dict]:
+    """
+    Build a normalised MAC → {aid, url} index from raw cached asset records.
+    Pure transform — no API calls.
+    """
+    console_url = "https://falcon.crowdstrike.com"
+    index: dict[str, dict] = {}
 
-            log.info("CS ExposureManagement %s: %d MAC(s) from %d asset(s)",
-                     label, macs_added, len(all_ids))
-            return macs_added
+    def _norm(raw: str) -> str:
+        return raw.lower().replace("-", "").replace(":", "").replace(".", "").strip()
 
-        # Try every plausible method name for network/IoT assets under FEM
-        for _qlabel, _qname, _gname, _upath in [
-            ("iot-assets",   "query_iot_assets",   "get_iot_assets",   "exposure-management/iot-assets"),
-            ("network-assets","query_network_assets","get_network_assets","exposure-management/network-assets"),
-            ("assets",       "query_assets",        "get_assets",       "exposure-management/assets"),
-            ("devices",      "query_devices",       "get_devices",      "exposure-management/devices"),
-        ]:
-            _fem_scroll_and_fetch(
-                _qlabel,
-                getattr(fem_svc, _qname, None),
-                getattr(fem_svc, _gname, None),
-                _upath,
-            )
+    def _add(macs_raw: list[str], asset_id: str, url: str) -> int:
+        added = 0
+        for raw in macs_raw:
+            n = _norm(raw)
+            if n and len(n) == 12 and n not in index:
+                index[n] = {"aid": asset_id, "url": url}
+                added += 1
+        return added
 
-    except ImportError:
-        log.debug("CS ExposureManagement: falconpy.ExposureManagement not available in this build")
-    except Exception as exc:
-        log.warning("CS ExposureManagement API failed: %s", exc, exc_info=True)
+    for host in (asset_data.get("hosts") or []):
+        aid  = host.get("device_id", "")
+        url  = f"{console_url}/host-management/hosts/{aid}"
+        macs: list[str] = []
+        for nic in (host.get("network_interfaces") or []):
+            m = nic.get("mac_address") or nic.get("mac") or ""
+            if m:
+                macs.append(m)
+        if host.get("mac_address"):
+            macs.append(host["mac_address"])
+        _add(macs, aid, url)
 
-    log.info("CS MAC index total: %d unique MAC(s) across Hosts + Discover", len(index))
+    for asset in (asset_data.get("discover_hosts") or []):
+        asset_id = asset.get("id", "")
+        url      = f"{console_url}/discover/hosts/{asset_id}"
+        macs: list[str] = []
+        for nic in (asset.get("network_interfaces") or []):
+            m = nic.get("mac_address") or nic.get("mac") or ""
+            if m:
+                macs.append(m)
+        for field in ("mac_address", "mac", "primary_mac"):
+            v = asset.get(field) or ""
+            if v:
+                macs.append(v)
+                break
+        _add(macs, asset_id, url)
+
+    log.info("CS index: %d unique MAC(s) from %d Hosts + %d Discover records",
+             len(index),
+             len(asset_data.get("hosts") or []),
+             len(asset_data.get("discover_hosts") or []))
     return index
+
+
+def _build_cs_index(force_rebuild: bool = False) -> dict[str, dict]:
+    """
+    Return a MAC → {aid, url} index, using the local asset cache when fresh.
+
+    force_rebuild=True skips the cache check and re-fetches from the API,
+    then saves the result to cache.
+    """
+    creds = _cs_creds()
+    if creds is None:
+        return {}
+
+    try:
+        import falconpy  # noqa: F401
+    except ImportError:
+        log.debug("CS: falconpy not installed — skipping enrichment")
+        return {}
+
+    # Use cache if fresh and not forced
+    if not force_rebuild and _cs_cache_is_fresh():
+        data = _cs_cache_load()
+        if data:
+            return _build_cs_index_from_assets(data)
+        log.debug("CS cache: load failed — falling back to live fetch")
+
+    # Fetch fresh data from the APIs
+    console.print("[bold]Fetching CrowdStrike asset data from API…[/bold]")
+    asset_data = _cs_fetch_assets(creds)
+    _cs_cache_save(asset_data)
+    return _build_cs_index_from_assets(asset_data)
 
 
 # ---------------------------------------------------------------------------
@@ -601,7 +576,7 @@ def cli():
 
 @cli.command("drift")
 @_add_options(_common_options)
-def cmd_drift(ips, ip_file, depth, no_discover, slow, verbose):
+def cmd_drift(ips, ip_file, depth, no_discover, slow, cs_refresh, verbose):
     """Show differences between SNMP data and NetBox (no changes written)."""
     _setup_logging(verbose)
     _print_integration_status()
@@ -632,7 +607,7 @@ def cmd_drift(ips, ip_file, depth, no_discover, slow, verbose):
         console.print(f"\n[cyan]{cable_count} cable(s) would be created from CDP/LLDP data.[/cyan]")
 
     # MAC table report
-    cs_index = _build_cs_index()
+    cs_index = _build_cs_index(force_rebuild=cs_refresh)
     mac_counts = sync_mod.sync_mac_table(disc.collected, nb, dry_run=True, cs_index=cs_index)
     if mac_counts.get("updated"):
         console.print(
@@ -647,7 +622,7 @@ def cmd_drift(ips, ip_file, depth, no_discover, slow, verbose):
               help="Compute changes but do not write to NetBox.")
 @click.option("--no-create", is_flag=True,
               help="Only update existing objects, do not create new ones.")
-def cmd_sync(ips, ip_file, depth, no_discover, slow, verbose, dry_run, no_create):
+def cmd_sync(ips, ip_file, depth, no_discover, slow, cs_refresh, verbose, dry_run, no_create):
     """Sync SNMP data into NetBox (creates and updates)."""
     _setup_logging(verbose)
     _print_integration_status()
@@ -690,7 +665,7 @@ def cmd_sync(ips, ip_file, depth, no_discover, slow, verbose, dry_run, no_create
 
     # MAC table sync — enrich with CrowdStrike data if available
     console.print("\n[bold]MAC table sync…[/bold]")
-    cs_index = _build_cs_index()
+    cs_index = _build_cs_index(force_rebuild=cs_refresh)
     mac_counts = sync_mod.sync_mac_table(disc.collected, nb, dry_run=dry_run, cs_index=cs_index)
 
     if dry_run:
@@ -983,7 +958,7 @@ def cmd_cs_lookup(macs: tuple[str, ...], verbose: bool, full_index: bool) -> Non
 
     if full_index:
         console.print("[bold]Building full CrowdStrike MAC index…[/bold]")
-        index = _build_cs_index()
+        index = _build_cs_index(force_rebuild=True)
         console.print(f"[green]Index built: {len(index)} unique MAC(s).[/green]\n")
         for raw in macs:
             norm = raw.lower().replace(":", "").replace("-", "").replace(".", "").strip()
@@ -1013,6 +988,76 @@ def cmd_cs_lookup(macs: tuple[str, ...], verbose: bool, full_index: bool) -> Non
                 t.add_row(raw, norm, "[red]not found[/red]", "", "", "", "")
 
     console.print(t)
+
+
+# ---------------------------------------------------------------------------
+# cs-build-cache command
+# ---------------------------------------------------------------------------
+
+@cli.command("cs-build-cache")
+@click.option("--verbose", "-v", is_flag=True)
+@click.option("--force", is_flag=True,
+              help="Rebuild even if the existing cache is still fresh.")
+def cmd_cs_build_cache(verbose: bool, force: bool) -> None:
+    """Pre-populate (or refresh) the local CrowdStrike asset cache.
+
+    Fetches all asset records from the Hosts and Discover APIs and writes
+    them to the cache file defined by CS_CACHE_FILE in config.py.
+    Subsequent drift/sync runs will use this cache instead of hitting the
+    API each time, until it becomes stale (CS_CACHE_MAX_AGE seconds, default 24 h).
+
+    \b
+    Examples:
+      python main.py cs-build-cache
+      python main.py cs-build-cache --force --verbose
+    """
+    _setup_logging(verbose)
+
+    cache_path = _cs_cache_path()
+    max_age    = getattr(config, "CS_CACHE_MAX_AGE", 86400)
+    console.print(f"Cache file : [cyan]{cache_path}[/cyan]")
+    console.print(f"Max age    : {max_age}s ({max_age // 3600}h)")
+
+    if not force and _cs_cache_is_fresh():
+        import time as _time
+        age = _time.time() - (cache_path.stat().st_mtime if cache_path else 0)
+        console.print(
+            f"[green]Cache is fresh (age {age:.0f}s).[/green]  "
+            f"Use [bold]--force[/bold] to rebuild anyway."
+        )
+        data = _cs_cache_load()
+        if data:
+            console.print(
+                f"  Hosts records    : {len(data.get('hosts', []))}\n"
+                f"  Discover records : {len(data.get('discover_hosts', []))}"
+            )
+        return
+
+    creds = _cs_creds()
+    if creds is None:
+        console.print("[red]No CrowdStrike credentials available — check CS_FEM_TOKEN.[/red]")
+        return
+    try:
+        import falconpy  # noqa: F401
+    except ImportError:
+        console.print("[red]falconpy not installed — pip install crowdstrike-falconpy[/red]")
+        return
+
+    console.print("[bold]Fetching CrowdStrike assets from API…[/bold]")
+    asset_data = _cs_fetch_assets(creds)
+    _cs_cache_save(asset_data)
+
+    t = Table(title="Cache build summary", show_lines=True)
+    t.add_column("Source")
+    t.add_column("Records", justify="right")
+    t.add_row("Hosts (sensor-managed)",    str(len(asset_data.get("hosts", []))))
+    t.add_row("Discover (unmanaged hosts)", str(len(asset_data.get("discover_hosts", []))))
+    console.print(t)
+
+    idx = _build_cs_index_from_assets(asset_data)
+    console.print(f"\n[green]MAC index: {len(idx)} unique MAC(s) ready.[/green]")
+    if cache_path:
+        console.print(f"Saved to: [cyan]{cache_path}[/cyan]")
 
 
 # ---------------------------------------------------------------------------

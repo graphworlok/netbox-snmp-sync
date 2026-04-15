@@ -57,6 +57,14 @@ SNMP_RETRIES = 2     # retries after timeout
 SNMP_TIMEOUT_SLOW = 30   # seconds per attempt
 SNMP_RETRIES_SLOW = 3    # retries after timeout
 
+# --- CrowdStrike local asset cache ---
+# Path to the JSON file that stores the full raw asset records from all CS APIs.
+# The MAC index is rebuilt from this cache rather than re-fetching from the API
+# on every run.  Set to "" or None to disable caching.
+CS_CACHE_FILE = "cs_asset_cache.json"
+# Maximum age in seconds before the cache is considered stale (default 24 h).
+CS_CACHE_MAX_AGE = 86400
+
 # --- Concurrency ---
 # Number of devices to poll via SNMP simultaneously during discovery.
 SNMP_WORKERS = 10
