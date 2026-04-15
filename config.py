@@ -97,6 +97,16 @@ DEFAULT_DEVICE_ROLE_SLUG = "network"   # e.g. "router", "switch", "firewall"
 CS_WORKSTATION_ROLE_SLUG = "workstation"
 CS_SERVER_ROLE_SLUG      = "server"
 
+# Device role slug for ephemeral endpoint devices created from bridge MAC table.
+# These represent network-visible endpoints without full management data.
+# The role (and an "Ephemeral Endpoint" device type) are created automatically.
+EPHEMERAL_ENDPOINT_ROLE_SLUG = "ephemeral-endpoint"
+
+# Device role slug for intermediate unmanaged switch devices inserted when
+# multiple MACs are learned on a single access port (hub, dumb switch, WAP, etc.).
+# The role (and an "Unmanaged Switch" device type) are created automatically.
+UNMANAGED_SWITCH_ROLE_SLUG = "unmanaged-switch"
+
 # ---------------------------------------------------------------------------
 # Cisco Meraki (optional)
 # ---------------------------------------------------------------------------

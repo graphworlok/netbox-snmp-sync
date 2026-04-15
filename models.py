@@ -16,6 +16,9 @@ class Platform(str, Enum):
     OPENWRT = "openwrt"   # OpenWrt (Linux-based router/AP OS)
     LINUX   = "linux"     # Generic Linux (net-snmp)
     MERAKI  = "meraki"    # Cisco Meraki (Dashboard API)
+    DELL_OS10  = "dell-os10"   # Dell EMC SmartFabric OS10 (Data Center)
+    DELL_OS9   = "dell-os9"    # Dell EMC FTOS / OS9 (Force10, S/Z-series)
+    DELL_PC    = "dell-pc"     # Dell PowerConnect / N-series (campus)
     UNKNOWN = "unknown"
 
 

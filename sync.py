@@ -582,7 +582,8 @@ def sync_mac_table(
     Returns totals: {"updated": N, "unchanged": N, "skipped": N}.
     """
     nb.ensure_mac_address_fields()
-    nb.ensure_crowdstrike_device_fields()
+    nb.ensure_crowdstrike_all_fields()
+    nb.ensure_ephemeral_endpoint_type()
     oui = OuiLookup.from_config()
 
     totals: dict[str, int] = {"updated": 0, "unchanged": 0, "skipped": 0}
@@ -655,6 +656,23 @@ def sync_mac_table(
                 totals["skipped"] += len(macs)
                 continue
 
+            # Skip Port-Channel / LAG interfaces — these are always inter-switch
+            # aggregated links, never direct endpoint connections.
+            if _is_port_channel(if_name):
+                log.debug(
+                    "MAC table sync: skipping %s/%s — Port-Channel/LAG interface "
+                    "(%d MAC(s) suppressed as inter-switch link)",
+                    device.display_name, if_name, len(macs),
+                )
+                totals["skipped"] += len(macs)
+                if not dry_run:
+                    try:
+                        nb.sync_interface_mac_table(nb_iface, if_name, set(), {}, {})
+                    except Exception:
+                        pass
+                    nb.set_interface_uncontrolled_tag(nb_iface, add=False)
+                continue
+
             # Skip uplink/trunk interfaces: if a CDP or LLDP neighbour is present
             # on this port, the MACs in the table are from the downstream network
             # and should not be stored as learned_macs on this interface.
@@ -682,6 +700,12 @@ def sync_mac_table(
                 log.info("  UNCONTROLLED device suspected on %s/%s (%d MACs, no CDP/LLDP)",
                          device.display_name, if_name, len(macs))
 
+            # Resolve the site of the switch for ephemeral endpoint placement
+            switch_site_id: Optional[int] = None
+            _nb_site = getattr(nb_dev, "site", None)
+            if _nb_site:
+                switch_site_id = getattr(_nb_site, "id", None)
+
             if dry_run:
                 cs_hits = sum(1 for m in macs if cs_index and cs_index.get(_norm(m)))
                 log.info("  [dry-run] %s/%s  %d MAC(s)%s%s",
@@ -702,6 +726,32 @@ def sync_mac_table(
                 totals["skipped"] += 1
 
             nb.set_interface_uncontrolled_tag(nb_iface, add=unmanaged_multimac)
+
+            # Create / update Ephemeral Endpoint device records for each learned MAC.
+            # Single MAC: cable directly to the switch access port.
+            # Multiple MACs: insert an Unmanaged Switch device between the switch
+            # port and the individual ephemeral endpoints (hub/dumb-switch topology).
+            if not unmanaged_multimac:
+                # Single endpoint — cable straight to the switch port
+                mac = next(iter(macs))
+                cs_hit = cs_index.get(_norm(mac)) if cs_index else None
+                nb.get_or_create_ephemeral_endpoint(
+                    mac, switch_site_id, cs_hit,
+                    upstream_iface_id=nb_iface.id,
+                )
+            else:
+                # Multiple endpoints — route through an Unmanaged Switch device
+                usw_name = f"usw:{device.display_name}/{if_name}"
+                mac_port_map = nb.get_or_create_unmanaged_switch(
+                    usw_name, switch_site_id, nb_iface.id, macs
+                )
+                for mac in macs:
+                    cs_hit = cs_index.get(_norm(mac)) if cs_index else None
+                    upstream = mac_port_map.get(mac.lower())
+                    nb.get_or_create_ephemeral_endpoint(
+                        mac, switch_site_id, cs_hit,
+                        upstream_iface_id=upstream,
+                    )
 
         # Write CS Falcon URL + tag directly onto each matched NetBox device
         for dev_id, hit in device_cs_hits.items():
@@ -1086,6 +1136,35 @@ _IFACE_ABBREV_TO_FULL = {
     "mgmt": "Management",
 }
 _IFACE_FULL_TO_ABBREV = {v: k for k, v in _IFACE_ABBREV_TO_FULL.items()}
+
+
+def _is_port_channel(name: str) -> bool:
+    """
+    Return True when *name* identifies a Port-Channel / LAG / bond interface.
+    These are always inter-switch aggregated links and must never be treated as
+    edge ports for MAC table learning.
+
+    Recognised patterns (case-insensitive):
+      Port-channel<N>  (Cisco IOS full name)
+      Po<N>            (Cisco IOS abbreviated)
+      port-channel<N>  (NX-OS)
+      LAG<N> / lag<N>  (Dell OS10 / generic LACP)
+      Bundle-Ether<N>  (IOS-XR)
+      ae<N>            (Juniper / PAN-OS)
+    """
+    n = name.lower()
+    if n.startswith("port-channel"):
+        return True
+    if n.startswith("bundle-ether"):
+        return True
+    if n.startswith("lag") and n[3:].lstrip("0123456789") == "":
+        return True
+    if n.startswith("ae") and n[2:].lstrip("0123456789") == "":
+        return True
+    # "Po<digits>" — must be followed only by digits (avoids "Po" prefix of "PoE" etc.)
+    if n.startswith("po") and n[2:].lstrip("0123456789") == "" and len(n) > 2:
+        return True
+    return False
 
 
 def _iface_name_variants(name: str) -> list[str]:

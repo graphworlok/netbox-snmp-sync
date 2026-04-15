@@ -734,6 +734,403 @@ class NetBoxClient:
                     except Exception as exc:
                         log.error("Could not create custom field %s: %s", field["name"], exc)
 
+    # ------------------------------------------------------------------
+    # Ephemeral Endpoint devices (bridge MAC table entries)
+    # ------------------------------------------------------------------
+
+    _EPHEMERAL_MFR          = {"slug": "generic",              "name": "Generic"}
+    _EPHEMERAL_TYPE_MODEL   = "Ephemeral Endpoint"
+    _UNMANAGED_SW_TYPE_MODEL = "Unmanaged Switch"
+    _EPHEMERAL_TAG          = {"name": "ephemeral-endpoint",   "slug": "ephemeral-endpoint",
+                               "color": "607d8b"}
+    _UNMANAGED_SW_TAG       = {"name": "unmanaged-switch",     "slug": "unmanaged-switch",
+                               "color": "ff9800"}
+
+    def ensure_ephemeral_endpoint_type(self) -> None:
+        """
+        Create the 'Generic' manufacturer, 'Ephemeral Endpoint' and 'Unmanaged Switch'
+        device types, the corresponding device roles, and the tags if absent.
+        Also ensures the cs_falcon_url URL custom field exists on dcim.device.
+        Idempotent.
+        """
+        import config as _cfg
+
+        # Manufacturer (shared by both device types)
+        self.get_or_create_manufacturer(
+            self._EPHEMERAL_MFR["slug"], self._EPHEMERAL_MFR["name"]
+        )
+
+        # Device types
+        self.get_or_create_device_type(
+            self._EPHEMERAL_TYPE_MODEL,
+            self._EPHEMERAL_MFR["slug"],
+            self._EPHEMERAL_MFR["name"],
+        )
+        self.get_or_create_device_type(
+            self._UNMANAGED_SW_TYPE_MODEL,
+            self._EPHEMERAL_MFR["slug"],
+            self._EPHEMERAL_MFR["name"],
+        )
+
+        # Device roles
+        self.get_or_create_device_role(_cfg.EPHEMERAL_ENDPOINT_ROLE_SLUG)
+        self.get_or_create_device_role(_cfg.UNMANAGED_SWITCH_ROLE_SLUG)
+
+        # Tags
+        for tag in (self._EPHEMERAL_TAG, self._UNMANAGED_SW_TAG):
+            if not self.nb.extras.tags.get(slug=tag["slug"]):
+                log.info("Creating tag: %s", tag["slug"])
+                if not self.dry_run:
+                    try:
+                        self.nb.extras.tags.create(tag)
+                    except Exception as exc:
+                        log.error("Could not create tag %s: %s", tag["slug"], exc)
+
+        # cs_falcon_url URL field on dcim.device (so links are clickable)
+        for field in self._CS_DEVICE_FIELDS_EXTENDED:
+            if not self.nb.extras.custom_fields.get(name=field["name"]):
+                log.info("Creating custom field: %s on dcim.device", field["name"])
+                if not self.dry_run:
+                    try:
+                        self.nb.extras.custom_fields.create(field)
+                    except Exception as exc:
+                        log.error("Could not create custom field %s: %s",
+                                  field["name"], exc)
+
+    def get_or_create_ephemeral_endpoint(
+        self,
+        mac: str,
+        site_id: Optional[int],
+        cs_data: Optional[dict] = None,
+        upstream_iface_id: Optional[int] = None,
+    ) -> Optional[object]:
+        """
+        Ensure a device of type 'Ephemeral Endpoint' exists for *mac* and that
+        its eth0 is cabled to *upstream_iface_id*.
+
+        *mac*               — colon-separated lowercase (e.g. 'aa:bb:cc:dd:ee:ff')
+        *site_id*           — NetBox site.id for device placement
+        *cs_data*           — optional dict {"aid": str, "url": str} from the CS index
+        *upstream_iface_id* — NetBox interface.id to cable eth0 to; this is either the
+                              switch access port (single-MAC case) or a port on an
+                              intermediate Unmanaged Switch device (multi-MAC case).
+
+        Device name is the MAC address.  An 'eth0' interface is created and the
+        MAC is assigned to it as a dcim.mac_addresses entry.  On subsequent runs
+        the cs_falcon_url custom field and the cable are updated if they have changed.
+
+        Returns the pynetbox device object, or None on failure.
+        """
+        import config as _cfg
+
+        # Build a normalised colon-separated name
+        mac_name = mac.lower()
+
+        cs_url = (cs_data or {}).get("url", "")
+
+        # Lookup existing
+        try:
+            existing = self.nb.dcim.devices.get(name=mac_name)
+        except Exception as exc:
+            log.error("Ephemeral endpoint lookup failed for %s: %s", mac_name, exc)
+            return None
+
+        if existing:
+            # Update CS URL if changed
+            current_cf = getattr(existing, "custom_fields", {}) or {}
+            if cs_url and current_cf.get("cs_falcon_url") != cs_url:
+                log.info("UPDATE ephemeral endpoint %s: cs_falcon_url → %s",
+                         mac_name, cs_url)
+                if not self.dry_run:
+                    try:
+                        existing.update({
+                            "custom_fields": {"cs_falcon_url": cs_url},
+                            "tags": (
+                                [{"slug": t.slug} for t in (getattr(existing, "tags", None) or [])]
+                                + [{"slug": "crowdstrike"}, {"slug": self._EPHEMERAL_TAG["slug"]}]
+                            ),
+                        })
+                    except Exception as exc:
+                        log.error("Could not update ephemeral endpoint %s: %s", mac_name, exc)
+
+            # Ensure the cable to the upstream port still exists
+            if upstream_iface_id is not None:
+                self._ensure_ephemeral_cable(existing, mac_name, upstream_iface_id)
+
+            return existing
+
+        # --- Create new ephemeral endpoint device ---
+        role = self.nb.dcim.device_roles.get(slug=_cfg.EPHEMERAL_ENDPOINT_ROLE_SLUG)
+        dt   = self.nb.dcim.device_types.get(
+            model=self._EPHEMERAL_TYPE_MODEL,
+            manufacturer=self._EPHEMERAL_MFR["slug"],
+        )
+        if not role or not dt:
+            log.error(
+                "Cannot create ephemeral endpoint %s: role or device type not found "
+                "(run ensure_ephemeral_endpoint_type first)",
+                mac_name,
+            )
+            return None
+
+        tags = [{"slug": self._EPHEMERAL_TAG["slug"]}]
+        if cs_url:
+            tags.append({"slug": "crowdstrike"})
+
+        payload: dict = {
+            "name":        mac_name,
+            "device_type": dt.id,
+            "role":        role.id,
+            "status":      "active",
+            "tags":        tags,
+        }
+        if site_id:
+            payload["site"] = site_id
+        if cs_url:
+            payload["custom_fields"] = {"cs_falcon_url": cs_url}
+
+        log.info("CREATE ephemeral endpoint: %s%s",
+                 mac_name, f"  [CS: {cs_url}]" if cs_url else "")
+        if self.dry_run:
+            return None
+        try:
+            device = self.nb.dcim.devices.create(payload)
+        except Exception as exc:
+            log.error("Could not create ephemeral endpoint %s: %s", mac_name, exc)
+            return None
+
+        # Create an 'eth0' interface and assign the MAC address to it
+        ep_iface = None
+        try:
+            ep_iface = self.nb.dcim.interfaces.create({
+                "device": device.id,
+                "name":   "eth0",
+                "type":   "other",
+            })
+            self.nb.dcim.mac_addresses.create({
+                "mac_address":          mac_name,
+                "assigned_object_type": "dcim.interface",
+                "assigned_object_id":   ep_iface.id,
+            })
+        except Exception as exc:
+            log.error("Could not create interface/MAC for ephemeral endpoint %s: %s",
+                      mac_name, exc)
+
+        # Cable eth0 to the upstream port (switch port or unmanaged switch port)
+        if upstream_iface_id is not None and ep_iface is not None:
+            try:
+                self.create_cable(upstream_iface_id, ep_iface.id, label=mac_name)
+            except Exception as exc:
+                log.error("Could not cable ephemeral endpoint %s to upstream port %s: %s",
+                          mac_name, upstream_iface_id, exc)
+
+        return device
+
+    def _ensure_ephemeral_cable(
+        self,
+        endpoint_device: object,
+        mac_name: str,
+        upstream_iface_id: int,
+    ) -> None:
+        """
+        Verify that the ephemeral endpoint's eth0 is cabled to *upstream_iface_id*.
+        Creates the cable if absent.  If eth0 is connected to a *different* port
+        (device moved), removes the stale cable first.
+        """
+        # Find the endpoint's eth0
+        try:
+            ep_iface = self.nb.dcim.interfaces.get(
+                device_id=endpoint_device.id, name="eth0"
+            )
+        except Exception as exc:
+            log.error("Could not look up eth0 for ephemeral endpoint %s: %s",
+                      mac_name, exc)
+            return
+
+        if ep_iface is None:
+            log.warning("Ephemeral endpoint %s has no eth0 interface", mac_name)
+            return
+
+        # Check existing cables on the endpoint's eth0
+        connected_ids = self.get_connected_interface_ids(ep_iface.id)
+        if upstream_iface_id in connected_ids:
+            return  # already cabled correctly
+
+        if connected_ids:
+            # The device appears to have moved — remove stale cable(s)
+            stale_cables = list(self.nb.dcim.cables.filter(
+                termination_a_type="dcim.interface", termination_a_id=ep_iface.id,
+            )) + list(self.nb.dcim.cables.filter(
+                termination_b_type="dcim.interface", termination_b_id=ep_iface.id,
+            ))
+            for cable in stale_cables:
+                other_ids = {
+                    t.get("object", {}).get("id")
+                    for term_list in (
+                        getattr(cable, "a_terminations", None) or [],
+                        getattr(cable, "b_terminations", None) or [],
+                    )
+                    for t in (term_list if isinstance(term_list, list) else [term_list])
+                }
+                if other_ids - {ep_iface.id}:
+                    log.info(
+                        "DELETE stale cable for moved endpoint %s (was on iface %s)",
+                        mac_name, other_ids - {ep_iface.id},
+                    )
+                    self.delete_cable(cable.id)
+
+        # Create the new cable
+        try:
+            self.create_cable(upstream_iface_id, ep_iface.id, label=mac_name)
+        except Exception as exc:
+            log.error("Could not cable ephemeral endpoint %s to upstream port %s: %s",
+                      mac_name, upstream_iface_id, exc)
+
+    def get_or_create_unmanaged_switch(
+        self,
+        name: str,
+        site_id: Optional[int],
+        switch_iface_id: int,
+        current_macs: set[str],
+    ) -> dict[str, int]:
+        """
+        Ensure an 'Unmanaged Switch' device exists for a multi-MAC access port and
+        return a mapping of mac → unmanaged-switch port interface ID.
+
+        *name*             — deterministic device name, e.g. 'usw:SW1/Gi1/0/5'
+        *site_id*          — NetBox site.id for device placement
+        *switch_iface_id*  — the real switch access port to cable the uplink to
+        *current_macs*     — set of colon-separated lowercase MACs currently seen
+
+        Topology created:
+          switch_access_port ←cable→ usw.uplink
+          usw.port-<mac>     ←cable→ ephemeral_endpoint.eth0   (one per MAC)
+
+        Stale ports (MACs that have disappeared) are removed; their cables are
+        deleted automatically by NetBox cascade.
+
+        Returns {mac: port_iface_id} for all MACs in *current_macs*.
+        """
+        import config as _cfg
+
+        mac_port_ids: dict[str, int] = {}
+
+        # --- Find or create the unmanaged switch device ---
+        try:
+            device = self.nb.dcim.devices.get(name=name)
+        except Exception as exc:
+            log.error("Unmanaged switch lookup failed for %s: %s", name, exc)
+            return mac_port_ids
+
+        if not device:
+            role = self.nb.dcim.device_roles.get(slug=_cfg.UNMANAGED_SWITCH_ROLE_SLUG)
+            dt   = self.nb.dcim.device_types.get(
+                model=self._UNMANAGED_SW_TYPE_MODEL,
+                manufacturer=self._EPHEMERAL_MFR["slug"],
+            )
+            if not role or not dt:
+                log.error(
+                    "Cannot create unmanaged switch %s: role or device type not found",
+                    name,
+                )
+                return mac_port_ids
+
+            payload: dict = {
+                "name":        name,
+                "device_type": dt.id,
+                "role":        role.id,
+                "status":      "active",
+                "tags":        [{"slug": self._UNMANAGED_SW_TAG["slug"]}],
+            }
+            if site_id:
+                payload["site"] = site_id
+
+            log.info("CREATE unmanaged switch: %s", name)
+            if self.dry_run:
+                return mac_port_ids
+            try:
+                device = self.nb.dcim.devices.create(payload)
+            except Exception as exc:
+                log.error("Could not create unmanaged switch %s: %s", name, exc)
+                return mac_port_ids
+
+        # --- Ensure uplink interface and cable to switch port ---
+        try:
+            uplink = self.nb.dcim.interfaces.get(device_id=device.id, name="uplink")
+        except Exception:
+            uplink = None
+
+        if not uplink and not self.dry_run:
+            try:
+                uplink = self.nb.dcim.interfaces.create({
+                    "device": device.id,
+                    "name":   "uplink",
+                    "type":   "other",
+                })
+            except Exception as exc:
+                log.error("Could not create uplink for unmanaged switch %s: %s", name, exc)
+
+        if uplink:
+            connected = self.get_connected_interface_ids(uplink.id)
+            if switch_iface_id not in connected:
+                # Remove any stale uplink cable (switch port changed)
+                if connected:
+                    stale = list(self.nb.dcim.cables.filter(
+                        termination_a_type="dcim.interface", termination_a_id=uplink.id,
+                    )) + list(self.nb.dcim.cables.filter(
+                        termination_b_type="dcim.interface", termination_b_id=uplink.id,
+                    ))
+                    for cable in stale:
+                        self.delete_cable(cable.id)
+                try:
+                    self.create_cable(switch_iface_id, uplink.id, label=f"{name}/uplink")
+                except Exception as exc:
+                    log.error("Could not cable uplink for %s: %s", name, exc)
+
+        # --- Reconcile per-MAC ports ---
+        # Fetch all existing interfaces on this device except 'uplink'
+        try:
+            existing_ifaces = {
+                iface.name: iface
+                for iface in self.nb.dcim.interfaces.filter(device_id=device.id)
+                if iface.name != "uplink"
+            }
+        except Exception as exc:
+            log.error("Could not list interfaces for unmanaged switch %s: %s", name, exc)
+            existing_ifaces = {}
+
+        current_port_names = {f"port-{mac.lower()}" for mac in current_macs}
+
+        # Remove stale ports (MACs no longer seen) — cable deleted by cascade
+        for port_name, iface in list(existing_ifaces.items()):
+            if port_name not in current_port_names:
+                log.info("DELETE stale port %s on unmanaged switch %s", port_name, name)
+                if not self.dry_run:
+                    try:
+                        iface.delete()
+                    except Exception as exc:
+                        log.error("Could not delete stale port %s on %s: %s",
+                                  port_name, name, exc)
+
+        # Create or return existing ports for current MACs
+        for mac in current_macs:
+            port_name = f"port-{mac.lower()}"
+            iface = existing_ifaces.get(port_name)
+            if not iface and not self.dry_run:
+                try:
+                    iface = self.nb.dcim.interfaces.create({
+                        "device": device.id,
+                        "name":   port_name,
+                        "type":   "other",
+                    })
+                    log.debug("CREATE port %s on unmanaged switch %s", port_name, name)
+                except Exception as exc:
+                    log.error("Could not create port %s on %s: %s", port_name, name, exc)
+            if iface:
+                mac_port_ids[mac.lower()] = iface.id
+
+        return mac_port_ids
+
     def get_device_by_crowdstrike_aid(self, aid: str) -> Optional[object]:
         """Return the NetBox device whose crowdstrike_aid custom field matches *aid*."""
         try:

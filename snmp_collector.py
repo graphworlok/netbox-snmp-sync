@@ -118,6 +118,18 @@ OID_CDP_CACHE_DEVICE_PORT = "1.3.6.1.4.1.9.9.23.1.2.1.1.7"
 OID_CDP_CACHE_PLATFORM    = "1.3.6.1.4.1.9.9.23.1.2.1.1.8"
 OID_CDP_CACHE_ADDRESS     = "1.3.6.1.4.1.9.9.23.1.2.1.1.4"
 
+# DELL-VENDOR-MIB (1.3.6.1.4.1.674) — fallback when ENTITY-MIB is sparse
+# PowerConnect / N-series
+OID_DELL_PC_MODEL      = "1.3.6.1.4.1.674.10895.3000.1.2.100.1.0"   # pcMfgName (product name)
+OID_DELL_PC_SERIAL     = "1.3.6.1.4.1.674.10895.3000.1.2.100.3.0"   # pcSerialNum
+OID_DELL_PC_VERSION    = "1.3.6.1.4.1.674.10895.3000.1.2.100.4.0"   # pcSwVersion
+# Dell Networking OS9 (Force10 / S-series / Z-series)
+OID_DELL_OS9_PRODUCT   = "1.3.6.1.4.1.6027.3.26.1.3.4.1.7.1"        # productName in F10-CHASSIS-MIB
+OID_DELL_OS9_SERIAL    = "1.3.6.1.4.1.6027.3.26.1.3.4.1.11.1"       # serialNumber
+# Dell OS10 / SmartFabric — uses standard ENTITY-MIB; these are fallbacks
+OID_DELL_OS10_MODEL    = "1.3.6.1.4.1.674.11000.5000.100.4.1.1.3.1.8"   # os10SystemCardModelName
+OID_DELL_OS10_SERIAL   = "1.3.6.1.4.1.674.11000.5000.100.4.1.1.3.1.4"   # os10SystemCardSerialNumber
+
 # ---------------------------------------------------------------------------
 # Protocol maps
 # ---------------------------------------------------------------------------
@@ -352,7 +364,7 @@ class SNMPCollector:
 
         info.neighbors = self._collect_lldp(interfaces)
         # CDP is Cisco-proprietary; only attempt on Cisco platforms and UNKNOWN
-        # (OpenWrt and Linux devices never implement CDP)
+        # (Dell, OpenWrt, and Linux devices never implement CDP)
         if info.platform in (Platform.IOS, Platform.IOSXR,
                              Platform.NXOS, Platform.ASA,
                              Platform.UNKNOWN):
@@ -388,6 +400,10 @@ class SNMPCollector:
             info.serial_number = serials.get(idx, "").strip()
             if not info.os_version:
                 info.os_version = sw_revs.get(idx, "").strip()
+
+            # Dell vendor-specific fallback when ENTITY-MIB is sparse/empty
+            if info.platform in (Platform.DELL_OS10, Platform.DELL_OS9, Platform.DELL_PC):
+                self._collect_entity_dell(info)
             return
 
         # Multiple chassis entries — stack detected; populate stack_members
@@ -418,6 +434,65 @@ class SNMPCollector:
         info.serial_number = primary.serial_number
         if not info.os_version:
             info.os_version = primary.os_version
+
+    def _collect_entity_dell(self, info: DeviceInfo) -> None:
+        """
+        Fill in model/serial/os_version from Dell vendor MIBs when ENTITY-MIB
+        is absent or returns empty strings.  Tries each Dell product line in
+        order and stops at the first successful retrieval.
+
+        OID families used:
+          PowerConnect / N-series : 1.3.6.1.4.1.674.10895.3000.*
+          OS9 / FTOS (Force10)    : 1.3.6.1.4.1.6027.3.26.*
+          OS10 / SmartFabric      : 1.3.6.1.4.1.674.11000.5000.*
+        """
+        def _fill(model_oid, serial_oid, version_oid=None) -> bool:
+            model  = (self._get(model_oid)  or "").strip()
+            serial = (self._get(serial_oid) or "").strip()
+            if not model and not serial:
+                return False
+            if model  and not info.model:
+                info.model = model
+                log.debug("Dell entity: model from vendor MIB: %s", model)
+            if serial and not info.serial_number:
+                info.serial_number = serial
+                log.debug("Dell entity: serial from vendor MIB: %s", serial)
+            if version_oid and not info.os_version:
+                ver = (self._get(version_oid) or "").strip()
+                if ver:
+                    info.os_version = ver
+                    log.debug("Dell entity: os_version from vendor MIB: %s", ver)
+            return True
+
+        if info.platform == Platform.DELL_PC:
+            if _fill(OID_DELL_PC_MODEL, OID_DELL_PC_SERIAL, OID_DELL_PC_VERSION):
+                return
+
+        if info.platform == Platform.DELL_OS9:
+            if _fill(OID_DELL_OS9_PRODUCT, OID_DELL_OS9_SERIAL):
+                return
+
+        if info.platform == Platform.DELL_OS10:
+            if _fill(OID_DELL_OS10_MODEL, OID_DELL_OS10_SERIAL):
+                return
+
+        # Last resort: walk the full ENTITY-MIB physical table and take the
+        # first non-empty model/serial regardless of class
+        if not info.model or not info.serial_number:
+            serials = self._walk(OID_ENT_PHYS_SERIAL)
+            models  = self._walk(OID_ENT_PHYS_MODEL)
+            for idx in sorted(serials.keys() | models.keys(),
+                              key=lambda x: int(x) if x.isdigit() else 9999):
+                m = models.get(idx, "").strip()
+                s = serials.get(idx, "").strip()
+                if m or s:
+                    if m and not info.model:
+                        info.model = m
+                    if s and not info.serial_number:
+                        info.serial_number = s
+                    log.debug("Dell entity: fallback ENTITY-MIB idx=%s model=%r serial=%r",
+                              idx, info.model, info.serial_number)
+                    break
 
     # ------------------------------------------------------------------
     # Interfaces
@@ -768,6 +843,12 @@ def _detect_platform(sys_descr: str) -> Platform:
     NX-OS      : "Cisco NX-OS(tm) n9k, Software (n9k-dk9), Version 7.0(3)I7(9)"
     ASA        : "Cisco Adaptive Security Appliance Software Version 9.14(3)9"
     PAN-OS     : "Palo Alto Networks PA-3220 series firewall. SW Version: 10.1.3"
+    Dell OS10  : "Dell EMC Networking OS10 Enterprise"
+                 "OS10 Enterprise 10.5.2.4"
+    Dell OS9   : "Dell Networking OS, Version 9.14.2.16"
+                 "Force10 Networks Real Time Operating System Software"
+    Dell PC    : "Dell PowerConnect 6224, 4.1.0.6, VxWorks 6.6"
+                 "Dell Networking N3048, OS Version: 6.4.0.8"
     OpenWrt    : "Linux OpenWrt 5.15.137 #0 SMP ..."
                  "OpenWrt Chaos Calmer 15.05 / LuCI ..."
     Linux      : "Linux hostname 5.15.0-91-generic #101-Ubuntu SMP ..."
@@ -783,6 +864,18 @@ def _detect_platform(sys_descr: str) -> Platform:
         return Platform.IOSXR
     if "cisco ios" in d:
         return Platform.IOS
+    # Dell OS10 (SmartFabric / Data Centre)
+    if "os10" in d or "dell emc networking os10" in d or "dell networking os10" in d:
+        return Platform.DELL_OS10
+    # Dell OS9 / FTOS (Force10, S-series, Z-series)
+    if "force10" in d or ("dell" in d and ("ftos" in d or "networking os" in d or "os version" in d)):
+        return Platform.DELL_OS9
+    # Dell PowerConnect / N-series (campus)
+    if "powerconnect" in d or ("dell" in d and ("powerconnect" in d or "n-series" in d)):
+        return Platform.DELL_PC
+    # Broader Dell catch — if none of the above matched but sysDescr starts with "dell"
+    if d.startswith("dell ") or "\ndell " in d:
+        return Platform.DELL_PC
     # Check OpenWrt before generic Linux — OpenWrt sysDescr contains "linux"
     if "openwrt" in d:
         return Platform.OPENWRT
@@ -821,6 +914,29 @@ def _parse_os_version(sys_descr: str, platform: Platform = Platform.UNKNOWN) -> 
     if platform == Platform.LINUX:
         # "Linux <hostname> <kernel-version> ..."
         match = re.search(r"Linux\s+\S+\s+([\d][\w\.\-]+)", sys_descr)
+        if match:
+            return match.group(1)
+
+    if platform == Platform.DELL_OS10:
+        # "OS10 Enterprise 10.5.2.4" or "Dell EMC Networking OS10 Enterprise 10.5.2.4"
+        match = re.search(r"OS10\s+\w+\s+([\d][\d\.]+)", sys_descr, re.IGNORECASE)
+        if match:
+            return match.group(1)
+
+    if platform == Platform.DELL_OS9:
+        # "Dell Networking OS, Version 9.14.2.16" or "FTOS Version 8.3.16.1"
+        match = re.search(r"[Vv]ersion\s+([\d][\d\.]+)", sys_descr)
+        if match:
+            return match.group(1)
+
+    if platform == Platform.DELL_PC:
+        # "Dell PowerConnect 6224, 4.1.0.6, VxWorks 6.6" — version is 2nd CSV field
+        # "Dell Networking N3048, OS Version: 6.4.0.8"
+        match = re.search(r"OS\s+[Vv]ersion[:\s]+([\d][\d\.]+)", sys_descr)
+        if match:
+            return match.group(1)
+        # Fallback: first dotted-number after comma
+        match = re.search(r",\s*([\d]+\.[\d\.]+)", sys_descr)
         if match:
             return match.group(1)
 
