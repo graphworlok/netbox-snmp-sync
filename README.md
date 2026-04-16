@@ -37,11 +37,42 @@ Query Cisco IOS, IOS-XE, IOS XR, NX-OS (Nexus), ASA, and Palo Alto PAN-OS device
 - A running NetBox instance (v3.3+) with an API token
 - SNMP enabled on target devices
 
+---
+
+## Installation
+
+### 1. Clone the repository
+
+```bash
+git clone https://github.com/graphworlok/netbox-snmp-sync.git
+cd netbox-snmp-sync
 ```
+
+### 2. Create a virtual environment and install dependencies
+
+```bash
+python3 -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
 Dependencies: `pysnmp`, `pynetbox`, `click`, `rich`
+
+### 3. Configure the tool
+
+Copy `config.py` and fill in your values — at minimum the NetBox URL and API token (see **Configuration** below). SNMP credentials are required for the tool to query any devices.
+
+### 4. (Optional) Download OUI files for vendor lookup
+
+If you want MAC addresses to show a vendor name, download the IEEE OUI assignment files:
+
+```bash
+curl -o oui-mal.csv   https://standards-oui.ieee.org/oui/oui.csv
+curl -o oui-mam.csv   https://standards-oui.ieee.org/oui28/mam.csv
+curl -o oui-mas.csv   https://standards-oui.ieee.org/oui36/oui36.csv
+```
+
+Then set `OUI_FILES` in `config.py` to point to the downloaded files.
 
 ---
 
