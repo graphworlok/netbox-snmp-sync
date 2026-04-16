@@ -560,7 +560,6 @@ def sync_mac_table(
     devices: list[DeviceInfo],
     nb: NetBoxClient,
     dry_run: bool = False,
-    cs_index: Optional[dict[str, dict]] = None,
 ) -> dict[str, int]:
     """
     Sync per-interface bridge forwarding table MACs into NetBox.
@@ -569,12 +568,13 @@ def sync_mac_table(
     interface — NOT as dcim.mac_addresses objects (those represent the
     port's own hardware address, not downstream learned addresses).
 
-    Each entry: {mac, vendor, cs_aid, cs_url}.  CrowdStrike fields are
-    populated when *cs_index* is supplied — a dict keyed by normalised
-    MAC (lowercase hex, no separators) → {"aid": str, "url": str}.
+    For each learned MAC an Ephemeral Endpoint device is created (or
+    updated) in NetBox and cabled to the switch access port.  When
+    multiple MACs appear on one port an intermediate Unmanaged Switch
+    device is inserted between the access port and the endpoints.
 
-    For stacked devices, interfaces are resolved against the individual
-    member devices rather than a single parent device.
+    Port-Channel / LAG interfaces and ports with a CDP/LLDP neighbour
+    are skipped — they carry inter-switch traffic, not endpoint MACs.
 
     Also applies / removes the 'unmanaged-multimac' tag: set when >1 MAC
     is learned on a port that has no CDP/LLDP neighbour.
@@ -582,14 +582,10 @@ def sync_mac_table(
     Returns totals: {"updated": N, "unchanged": N, "skipped": N}.
     """
     nb.ensure_mac_address_fields()
-    nb.ensure_crowdstrike_all_fields()
     nb.ensure_ephemeral_endpoint_type()
     oui = OuiLookup.from_config()
 
     totals: dict[str, int] = {"updated": 0, "unchanged": 0, "skipped": 0}
-
-    def _norm(mac: str) -> str:
-        return mac.lower().replace(":", "").replace("-", "").replace(".", "")
 
     for device in devices:
         if not device.mac_table:
@@ -619,27 +615,6 @@ def sync_mac_table(
             continue
 
         log.info("MAC table sync: %s  %d interface(s)", device.display_name, len(by_iface))
-
-        # Check the device's own interface MAC addresses against CS.
-        # These are the switch's hardware MACs, not learned/forwarded MACs.
-        # Keyed by nb_dev.id → first CS hit found {aid, url}.
-        device_cs_hits: dict[int, dict] = {}
-        if cs_index:
-            for iface in device.interfaces:
-                if not iface.mac_address:
-                    continue
-                hit = cs_index.get(_norm(iface.mac_address))
-                if not hit:
-                    continue
-                # Resolve which NetBox device this interface belongs to
-                nb_dev = iface_device_map.get(iface.name)
-                if nb_dev is None:
-                    continue
-                if nb_dev.id not in device_cs_hits:
-                    device_cs_hits[nb_dev.id] = {"nb_dev": nb_dev, **hit}
-                    log.debug("CS device match: %s own MAC %s → %s",
-                              getattr(nb_dev, "name", nb_dev.id),
-                              iface.mac_address, hit.get("url", ""))
 
         for if_name, macs in by_iface.items():
             nb_dev = iface_device_map.get(if_name)
@@ -707,17 +682,15 @@ def sync_mac_table(
                 switch_site_id = getattr(_nb_site, "id", None)
 
             if dry_run:
-                cs_hits = sum(1 for m in macs if cs_index and cs_index.get(_norm(m)))
-                log.info("  [dry-run] %s/%s  %d MAC(s)%s%s",
+                log.info("  [dry-run] %s/%s  %d MAC(s)%s",
                          device.display_name, if_name, len(macs),
-                         f"  {cs_hits} CrowdStrike match(es)" if cs_hits else "",
                          "  [unmanaged-multimac]" if unmanaged_multimac else "")
                 totals["updated"] += 1
                 continue
 
             try:
                 counts = nb.sync_interface_mac_table(
-                    nb_iface, if_name, macs, vendor_map, cs_index
+                    nb_iface, if_name, macs, vendor_map
                 )
                 for k, v in counts.items():
                     totals[k] += v
@@ -734,9 +707,8 @@ def sync_mac_table(
             if not unmanaged_multimac:
                 # Single endpoint — cable straight to the switch port
                 mac = next(iter(macs))
-                cs_hit = cs_index.get(_norm(mac)) if cs_index else None
                 nb.get_or_create_ephemeral_endpoint(
-                    mac, switch_site_id, cs_hit,
+                    mac, switch_site_id,
                     upstream_iface_id=nb_iface.id,
                 )
             else:
@@ -746,30 +718,11 @@ def sync_mac_table(
                     usw_name, switch_site_id, nb_iface.id, macs
                 )
                 for mac in macs:
-                    cs_hit = cs_index.get(_norm(mac)) if cs_index else None
                     upstream = mac_port_map.get(mac.lower())
                     nb.get_or_create_ephemeral_endpoint(
-                        mac, switch_site_id, cs_hit,
+                        mac, switch_site_id,
                         upstream_iface_id=upstream,
                     )
-
-        # Write CS Falcon URL + tag directly onto each matched NetBox device
-        for dev_id, hit in device_cs_hits.items():
-            nb_dev   = hit["nb_dev"]
-            cs_url   = hit.get("url", "")
-            existing = getattr(nb_dev, "custom_fields", {}) or {}
-            if existing.get("cs_falcon_url") == cs_url:
-                log.debug("MAC table sync: CS URL unchanged on %s", getattr(nb_dev, "name", dev_id))
-                continue
-            log.info("MAC table sync: writing CS Falcon URL to device %s → %s",
-                     getattr(nb_dev, "name", dev_id), cs_url)
-            if not dry_run:
-                try:
-                    nb_dev.update({"custom_fields": {"cs_falcon_url": cs_url}})
-                    nb.set_device_tag(nb_dev, "crowdstrike", add=True)
-                except Exception as exc:
-                    log.error("Could not update CS URL on device %s: %s",
-                              getattr(nb_dev, "name", dev_id), exc)
 
     return totals
 

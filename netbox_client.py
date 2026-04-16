@@ -447,7 +447,6 @@ class NetBoxClient:
         if_name: str,
         snmp_macs: set[str],
         vendor_map: Optional[dict[str, str]] = None,
-        cs_index: Optional[dict[str, dict]] = None,
     ) -> dict[str, int]:
         """
         Store bridge forwarding table MACs in the 'learned_macs' JSON custom
@@ -457,30 +456,22 @@ class NetBoxClient:
           {
             "mac":    "aa:bb:cc:dd:ee:ff",
             "vendor": "Vendor Inc.",        (from OUI lookup, may be "")
-            "cs_aid": "abc123...",          (CrowdStrike AID, if found)
-            "cs_url": "https://falcon..."   (Falcon host page URL, if found)
           }
 
-        *cs_index* is an optional dict keyed by normalised MAC (lowercase,
-        no separators) → {"aid": str, "url": str}, built by the caller from
-        CrowdStrike data.
+        CrowdStrike enrichment (cs_falcon_url etc.) is applied to Ephemeral
+        Endpoint devices by cs_sync.py, not stored here.
 
         Returns {"updated": 0|1, "unchanged": 0|1}.
         """
         import json as _json
 
         vendor_map = vendor_map or {}
-        cs_index   = cs_index   or {}
 
         entries = []
         for mac in sorted(snmp_macs):
-            norm = mac.lower().replace(":", "")
-            cs   = cs_index.get(norm, {})
             entries.append({
                 "mac":    mac,
                 "vendor": vendor_map.get(mac, ""),
-                "cs_aid": cs.get("aid", ""),
-                "cs_url": cs.get("url", ""),
             })
 
         new_json = _json.dumps(entries, separators=(",", ":"))
@@ -499,9 +490,8 @@ class NetBoxClient:
         if old_norm == new_norm:
             return {"updated": 0, "unchanged": 1}
 
-        cs_count = sum(1 for e in entries if e["cs_aid"])
-        log.info("UPDATE learned_macs: %s/%s  %d MAC(s), %d with CrowdStrike",
-                 if_name, getattr(iface, "id", "?"), len(entries), cs_count)
+        log.info("UPDATE learned_macs: %s/%s  %d MAC(s)",
+                 if_name, getattr(iface, "id", "?"), len(entries))
 
         if not self.dry_run:
             try:
@@ -801,7 +791,6 @@ class NetBoxClient:
         self,
         mac: str,
         site_id: Optional[int],
-        cs_data: Optional[dict] = None,
         upstream_iface_id: Optional[int] = None,
     ) -> Optional[object]:
         """
@@ -810,14 +799,13 @@ class NetBoxClient:
 
         *mac*               — colon-separated lowercase (e.g. 'aa:bb:cc:dd:ee:ff')
         *site_id*           — NetBox site.id for device placement
-        *cs_data*           — optional dict {"aid": str, "url": str} from the CS index
         *upstream_iface_id* — NetBox interface.id to cable eth0 to; this is either the
                               switch access port (single-MAC case) or a port on an
                               intermediate Unmanaged Switch device (multi-MAC case).
 
         Device name is the MAC address.  An 'eth0' interface is created and the
-        MAC is assigned to it as a dcim.mac_addresses entry.  On subsequent runs
-        the cs_falcon_url custom field and the cable are updated if they have changed.
+        MAC is assigned to it as a dcim.mac_addresses entry.  CrowdStrike enrichment
+        (cs_falcon_url, crowdstrike tag) is handled by cs_sync.py — not this tool.
 
         Returns the pynetbox device object, or None on failure.
         """
@@ -825,8 +813,6 @@ class NetBoxClient:
 
         # Build a normalised colon-separated name
         mac_name = mac.lower()
-
-        cs_url = (cs_data or {}).get("url", "")
 
         # Lookup existing
         try:
@@ -836,27 +822,9 @@ class NetBoxClient:
             return None
 
         if existing:
-            # Update CS URL if changed
-            current_cf = getattr(existing, "custom_fields", {}) or {}
-            if cs_url and current_cf.get("cs_falcon_url") != cs_url:
-                log.info("UPDATE ephemeral endpoint %s: cs_falcon_url → %s",
-                         mac_name, cs_url)
-                if not self.dry_run:
-                    try:
-                        existing.update({
-                            "custom_fields": {"cs_falcon_url": cs_url},
-                            "tags": (
-                                [{"slug": t.slug} for t in (getattr(existing, "tags", None) or [])]
-                                + [{"slug": "crowdstrike"}, {"slug": self._EPHEMERAL_TAG["slug"]}]
-                            ),
-                        })
-                    except Exception as exc:
-                        log.error("Could not update ephemeral endpoint %s: %s", mac_name, exc)
-
             # Ensure the cable to the upstream port still exists
             if upstream_iface_id is not None:
                 self._ensure_ephemeral_cable(existing, mac_name, upstream_iface_id)
-
             return existing
 
         # --- Create new ephemeral endpoint device ---
@@ -873,24 +841,17 @@ class NetBoxClient:
             )
             return None
 
-        tags = [{"slug": self._EPHEMERAL_TAG["slug"]}]
-        if cs_url:
-            tags.append({"slug": "crowdstrike"})
-
         payload: dict = {
             "name":        mac_name,
             "device_type": dt.id,
             "role":        role.id,
             "status":      "active",
-            "tags":        tags,
+            "tags":        [{"slug": self._EPHEMERAL_TAG["slug"]}],
         }
         if site_id:
             payload["site"] = site_id
-        if cs_url:
-            payload["custom_fields"] = {"cs_falcon_url": cs_url}
 
-        log.info("CREATE ephemeral endpoint: %s%s",
-                 mac_name, f"  [CS: {cs_url}]" if cs_url else "")
+        log.info("CREATE ephemeral endpoint: %s", mac_name)
         if self.dry_run:
             return None
         try:
