@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "netbox-snmp-sync"
+version = "0.1.0"
+description = "NetBox plugin to discover and sync devices via SNMP"
+requires-python = ">=3.10"
+dependencies = [
+    "pysnmp>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-django"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["netbox_snmp_sync*"]

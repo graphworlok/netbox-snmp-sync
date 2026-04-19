@@ -1,0 +1,15 @@
+{% extends 'generic/object_list.html' %}
+{% load helpers %}
+
+{% block title %}Learned MAC Addresses{% endblock %}
+
+{% block extra_controls %}
+<form method="post" action="{% url 'plugins:netbox_snmp_sync:learned_mac_mark_stale' %}" class="d-inline">
+  {% csrf_token %}
+  <input type="hidden" name="cutoff_hours" value="48">
+  <button type="submit" class="btn btn-sm btn-outline-secondary"
+    onclick="return confirm('Mark MACs not seen in 48 hours as stale?')">
+    <i class="mdi mdi-clock-outline"></i> Mark Stale (&gt;48h)
+  </button>
+</form>
+{% endblock %}

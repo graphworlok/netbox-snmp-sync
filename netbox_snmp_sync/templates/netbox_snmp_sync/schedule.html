@@ -1,0 +1,71 @@
+{% extends 'base/layout.html' %}
+{% load helpers %}
+
+{% block title %}SNMP Sync — Schedule{% endblock %}
+
+{% block content %}
+<div class="row">
+  <div class="col col-md-7">
+
+    <div class="card">
+      <h5 class="card-header d-flex justify-content-between align-items-center">
+        Schedule Configuration
+        <a href="{% url 'plugins:netbox_snmp_sync:schedule_edit' %}" class="btn btn-sm btn-warning">
+          <i class="mdi mdi-pencil"></i> Edit
+        </a>
+      </h5>
+      <div class="card-body">
+        <table class="table table-hover attr-table">
+          <tr>
+            <th scope="row">Enabled</th>
+            <td>{% if schedule.enabled %}<span class="badge bg-success">Yes</span>{% else %}<span class="badge bg-secondary">No</span>{% endif %}</td>
+          </tr>
+          <tr><th scope="row">Cron Expression</th><td><code>{{ schedule.cron_expression|default:"—" }}</code></td></tr>
+          <tr><th scope="row">Max Discovery Depth</th><td>{{ schedule.max_depth }}</td></tr>
+          <tr><th scope="row">Max Workers</th><td>{{ schedule.max_workers }}</td></tr>
+          <tr><th scope="row">Last Run</th><td>{{ schedule.last_run_at|default:"Never" }}</td></tr>
+          <tr>
+            <th scope="row">Last Run Status</th>
+            <td>{% if schedule.last_run_status %}{{ schedule.last_run_status }}{% else %}—{% endif %}</td>
+          </tr>
+        </table>
+      </div>
+    </div>
+
+    <div class="card mt-3">
+      <h5 class="card-header">Seed IPs</h5>
+      <div class="card-body">
+        {% if schedule.seed_ip_list %}
+        <ul class="list-unstyled mb-0">
+          {% for ip in schedule.seed_ip_list %}
+          <li><code>{{ ip }}</code></li>
+          {% endfor %}
+        </ul>
+        {% else %}
+        <span class="text-muted">No seed IPs configured.</span>
+        {% endif %}
+      </div>
+    </div>
+
+  </div>
+
+  <div class="col col-md-5">
+    <div class="card">
+      <h5 class="card-header">External Scheduler Setup</h5>
+      <div class="card-body text-muted small">
+        <p>NetBox does not run background jobs directly. Use <strong>cron</strong> or a
+        <strong>systemd timer</strong> to execute the sync management command.</p>
+        {% if schedule.cron_expression %}
+        <p><strong>Cron entry</strong> (paste into <code>crontab -e</code>):</p>
+        <pre class="small">{{ schedule.cron_expression }} cd /opt/netbox && python manage.py sync_snmp</pre>
+        {% endif %}
+        <hr>
+        <p>The management command reads seed IPs and SNMP settings from the database
+        (this page) and SNMP credentials from the <strong>SNMP Credentials</strong> store.</p>
+        <p>To run manually:</p>
+        <pre class="small">python manage.py sync_snmp</pre>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

@@ -1,0 +1,94 @@
+{% extends 'base/layout.html' %}
+{% load helpers form_helpers %}
+
+{% block title %}OUI Databases{% endblock %}
+
+{% block content %}
+<div class="row">
+  <div class="col col-md-8">
+    <div class="card">
+      <h5 class="card-header">IEEE OUI Registries</h5>
+      <div class="card-body p-0">
+        <table class="table table-hover mb-0">
+          <thead>
+            <tr>
+              <th>Registry</th>
+              <th>File Path</th>
+              <th>Entries</th>
+              <th>Size</th>
+              <th>Last Downloaded</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for db in databases %}
+            <tr>
+              <td><span class="badge bg-{{ db.get_registry_color }}">{{ db.registry }}</span></td>
+              <td>
+                {% if db.local_path %}
+                  <code class="small">{{ db.local_path }}</code>
+                {% else %}
+                  <span class="text-muted">—</span>
+                {% endif %}
+              </td>
+              <td>{% if db.entry_count %}{{ db.entry_count|intcomma }}{% else %}—{% endif %}</td>
+              <td>{% if db.file_size_kb %}{{ db.file_size_kb }} KB{% else %}—{% endif %}</td>
+              <td>{{ db.last_downloaded|default:"Never" }}</td>
+              <td>
+                {% if db.last_error %}
+                  <span class="badge bg-danger" title="{{ db.last_error }}">Error</span>
+                {% elif db.file_exists %}
+                  <span class="badge bg-success">OK</span>
+                {% else %}
+                  <span class="badge bg-secondary">Not downloaded</span>
+                {% endif %}
+              </td>
+            </tr>
+            {% if db.last_error %}
+            <tr>
+              <td colspan="6"><pre class="text-danger mb-0 small">{{ db.last_error }}</pre></td>
+            </tr>
+            {% endif %}
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="col col-md-4">
+    <div class="card">
+      <h5 class="card-header">Download OUI File</h5>
+      <div class="card-body">
+        <p class="text-muted small">
+          Files are downloaded from the IEEE standards server and saved locally.
+          MA-L covers 24-bit assignments (~37k entries) and is the most commonly needed.
+          The download may take 10–30 seconds.
+        </p>
+        <form method="post" action="{% url 'plugins:netbox_snmp_sync:oui_download' %}">
+          {% csrf_token %}
+          {% render_field form.registry %}
+          {% render_field form.storage_path %}
+          <button type="submit" class="btn btn-primary btn-sm mt-2">
+            <i class="mdi mdi-download"></i> Download
+          </button>
+        </form>
+      </div>
+    </div>
+
+    <div class="card mt-3">
+      <h5 class="card-header">About OUI Lookup</h5>
+      <div class="card-body text-muted small">
+        <p>OUI (Organisationally Unique Identifier) files map the first 3 octets
+        of a MAC address to a vendor name.</p>
+        <p>After downloading, configure the plugin to use the files by setting
+        <code>oui_file</code> in <code>PLUGINS_CONFIG</code>, e.g.:</p>
+        <pre class="small">"oui_file": [
+  "/opt/netbox/oui/oui.csv",
+  "/opt/netbox/oui/mam.csv",
+]</pre>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

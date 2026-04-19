@@ -1,0 +1,46 @@
+{% extends 'base/layout.html' %}
+{% load helpers form_helpers %}
+
+{% block title %}SNMP Sync — Edit Schedule{% endblock %}
+
+{% block content %}
+<form method="post">
+  {% csrf_token %}
+  <div class="row">
+    <div class="col col-md-7">
+
+      <div class="card">
+        <h5 class="card-header">Schedule Settings</h5>
+        <div class="card-body">
+          {% render_field form.enabled %}
+          {% render_field form.cron_expression %}
+          {% render_field form.max_depth %}
+          {% render_field form.max_workers %}
+        </div>
+      </div>
+
+      <div class="card mt-3">
+        <h5 class="card-header">Seed IPs</h5>
+        <div class="card-body">
+          {% render_field form.seed_ips %}
+          <p class="text-muted small mt-1">
+            One IP address per line. These are the starting points for SNMP discovery.
+            When <em>Max Discovery Depth</em> is &gt; 0, the sync will also walk CDP/LLDP
+            neighbours discovered from each seed.
+          </p>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <div class="row mt-3">
+    <div class="col">
+      <button type="submit" class="btn btn-primary">
+        <i class="mdi mdi-content-save"></i> Save
+      </button>
+      <a href="{% url 'plugins:netbox_snmp_sync:schedule' %}" class="btn btn-outline-secondary ms-2">Cancel</a>
+    </div>
+  </div>
+</form>
+{% endblock %}

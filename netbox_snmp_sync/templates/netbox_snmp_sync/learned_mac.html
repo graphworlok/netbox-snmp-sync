@@ -1,0 +1,68 @@
+{% extends 'generic/object.html' %}
+{% load helpers %}
+
+{% block title %}MAC: {{ object.mac_address }}{% endblock %}
+
+{% block content %}
+<div class="row">
+  <div class="col col-md-6">
+    <div class="card">
+      <h5 class="card-header">MAC Details</h5>
+      <div class="card-body">
+        <table class="table table-hover attr-table">
+          <tr><th scope="row">MAC Address</th><td><code>{{ object.mac_address }}</code></td></tr>
+          <tr><th scope="row">Vendor</th><td>{{ object.vendor|default:"—" }}</td></tr>
+          <tr>
+            <th scope="row">Status</th>
+            <td><span class="badge bg-{{ object.get_status_color }}">{{ object.get_status_display }}</span></td>
+          </tr>
+          <tr>
+            <th scope="row">Entry Type</th>
+            <td><span class="badge bg-{{ object.get_entry_type_color }}">{{ object.get_entry_type_display }}</span></td>
+          </tr>
+          <tr><th scope="row">VLAN</th><td>{% if object.vlan %}{{ object.vlan }}{% else %}—{% endif %}</td></tr>
+          <tr><th scope="row">First Seen</th><td>{{ object.first_seen }}</td></tr>
+          <tr><th scope="row">Last Seen</th><td>{{ object.last_seen }}</td></tr>
+        </table>
+      </div>
+    </div>
+
+    {% if object.status == "promoted" %}
+    <div class="card mt-3">
+      <h5 class="card-header">Promoted Device</h5>
+      <div class="card-body">
+        <table class="table table-hover attr-table">
+          <tr><th scope="row">NetBox Device ID</th><td>{{ object.promoted_to_device_id }}</td></tr>
+          <tr><th scope="row">Promoted At</th><td>{{ object.promoted_at }}</td></tr>
+        </table>
+      </div>
+    </div>
+    {% endif %}
+  </div>
+
+  <div class="col col-md-6">
+    <div class="card">
+      <h5 class="card-header">Source</h5>
+      <div class="card-body">
+        <table class="table table-hover attr-table">
+          <tr><th scope="row">Device Name</th><td>{{ object.source_device_name|default:"—" }}</td></tr>
+          <tr><th scope="row">Device IP</th><td><code>{{ object.source_device_ip }}</code></td></tr>
+          <tr><th scope="row">Interface</th><td>{{ object.source_interface|default:"—" }}</td></tr>
+        </table>
+      </div>
+    </div>
+
+    {% if object.is_promotable %}
+    <div class="card mt-3">
+      <h5 class="card-header">Actions</h5>
+      <div class="card-body">
+        <a href="{% url 'plugins:netbox_snmp_sync:learned_mac_promote' object.pk %}"
+           class="btn btn-success btn-sm">
+          <i class="mdi mdi-arrow-up-circle"></i> Promote to Device
+        </a>
+      </div>
+    </div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}
