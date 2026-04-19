@@ -1065,6 +1065,160 @@ def _resolve_site(info: DeviceInfo, nb: NetBoxClient) -> Optional[object]:
 
 
 # ---------------------------------------------------------------------------
+# Routing table / BGP / IPAM sync
+# ---------------------------------------------------------------------------
+
+# Routes with these protocol values are purely infrastructure housekeeping
+# (e.g. local host /32 or loopback routes) and should not be written to IPAM.
+_SKIP_PROTOCOLS = frozenset()
+
+# Default maximum prefix length to write.  /32 host routes from the routing
+# table flood IPAM with noise; callers can override with min_prefix_len.
+_DEFAULT_MAX_PREFIX_LEN = 30
+
+
+def sync_routing_table(
+    devices: list[DeviceInfo],
+    nb: NetBoxClient,
+    *,
+    protocols: Optional[set] = None,
+    max_prefix_len: int = _DEFAULT_MAX_PREFIX_LEN,
+    dry_run: bool = False,
+    site_tag: bool = True,
+) -> dict[str, int]:
+    """
+    Write routing table prefixes from *devices* into NetBox IPAM.
+
+    Only prefixes collected via collect_routing() (i.e. ``device.routing_table``
+    is populated) are processed.  For each device the SNMP source address is
+    used to determine the NetBox site to associate with created prefixes.
+
+    Parameters
+    ----------
+    protocols
+        Set of RouteProtocol values to sync.  ``None`` means all.
+    max_prefix_len
+        Prefixes longer than this are skipped (avoids flooding IPAM with
+        /32 host routes or /128 IPv6 host addresses).
+    site_tag
+        When True, attach the source device's NetBox site to each prefix.
+
+    Returns totals: {"created": N, "updated": N, "skipped": N}.
+    """
+    from models import RouteProtocol
+
+    totals: dict[str, int] = {"created": 0, "updated": 0, "skipped": 0}
+
+    for device in devices:
+        if not device.routing_table:
+            continue
+
+        # Resolve the NetBox site for the source device
+        site_id: Optional[int] = None
+        if site_tag:
+            site = nb.site_for_ip(device.query_ip)
+            if site:
+                site_id = site.id
+
+        # Build a description prefix so we can identify SNMP-sourced entries
+        device_label = device.display_name
+
+        for route in device.routing_table:
+            if route.prefix_length > max_prefix_len:
+                totals["skipped"] += 1
+                continue
+            if protocols is not None and route.protocol not in protocols:
+                totals["skipped"] += 1
+                continue
+            # Skip 0.0.0.0/0 default routes — they carry no IPAM information
+            if route.destination == "0.0.0.0" and route.prefix_length == 0:
+                totals["skipped"] += 1
+                continue
+            # Skip host-route loopback addresses (127.0.0.0/8 range)
+            if route.destination.startswith("127."):
+                totals["skipped"] += 1
+                continue
+
+            description = (
+                f"[snmp-sync] {device_label} via {route.protocol.value}"
+            )
+            if route.if_name:
+                description += f" ({route.if_name})"
+
+            tags = ["snmp-sync"]
+            if route.protocol.value in ("bgp",):
+                tags.append("bgp-learned")
+
+            _, created = nb.create_or_update_prefix(
+                prefix=route.prefix,
+                status="active",
+                description=description,
+                site_id=site_id,
+                tags=tags,
+            )
+            if created:
+                totals["created"] += 1
+            else:
+                totals["updated"] += 1
+
+    return totals
+
+
+def sync_asns(
+    devices: list[DeviceInfo],
+    nb: NetBoxClient,
+    *,
+    rir_slug: str = "unknown",
+    dry_run: bool = False,
+) -> dict[str, int]:
+    """
+    Write ASN records for BGP local AS and peer remote ASes from *devices*.
+
+    Creates one ``ipam.asn`` record per unique AS number encountered across all
+    devices.  Skips devices where ``bgp_local_as`` is None (i.e. BGP is not
+    running or was not collected).
+
+    Returns totals: {"created": N, "existing": N}.
+    """
+    totals: dict[str, int] = {"created": 0, "existing": 0}
+    seen: set[int] = set()
+
+    for device in devices:
+        if not device.bgp_local_as:
+            continue
+
+        as_numbers: set[int] = {device.bgp_local_as}
+        for peer in device.bgp_peers:
+            if peer.remote_as:
+                as_numbers.add(peer.remote_as)
+
+        for asn in sorted(as_numbers):
+            if asn in seen:
+                continue
+            seen.add(asn)
+
+            # Determine a description from the source device for local AS
+            if asn == device.bgp_local_as:
+                description = f"Local AS on {device.display_name}"
+            else:
+                description = f"BGP peer of {device.display_name}"
+
+            obj = nb.get_or_create_asn(asn, rir_slug=rir_slug,
+                                        description=description)
+            if obj is None:
+                # dry_run — count as would-be create
+                totals["created"] += 1
+            else:
+                # get_or_create_asn returns existing object if it already existed;
+                # we can't distinguish without extra tracking, so log a debug
+                log.debug("ASN AS%d — record present (id=%s)", asn,
+                          getattr(obj, "id", "?"))
+                totals["existing"] += 1
+
+    return totals
+
+
+# ---------------------------------------------------------------------------
 # Utility
 # ---------------------------------------------------------------------------
 

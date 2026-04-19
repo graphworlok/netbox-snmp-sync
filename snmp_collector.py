@@ -48,6 +48,8 @@ from pysnmp.hlapi import (
 
 from models import (
     AdminStatus,
+    BgpPeer,
+    BgpPeerState,
     DeviceInfo,
     Interface,
     IPAddress,
@@ -56,7 +58,11 @@ from models import (
     Neighbor,
     OperStatus,
     Platform,
+    RouteEntry,
+    RouteProtocol,
     StackMember,
+    _SNMP_BGP_STATE_MAP,
+    _SNMP_PROTO_MAP,
 )
 
 log = logging.getLogger(__name__)
@@ -117,6 +123,32 @@ OID_CDP_CACHE_DEVICE_ID   = "1.3.6.1.4.1.9.9.23.1.2.1.1.6"
 OID_CDP_CACHE_DEVICE_PORT = "1.3.6.1.4.1.9.9.23.1.2.1.1.7"
 OID_CDP_CACHE_PLATFORM    = "1.3.6.1.4.1.9.9.23.1.2.1.1.8"
 OID_CDP_CACHE_ADDRESS     = "1.3.6.1.4.1.9.9.23.1.2.1.1.4"
+
+# IP-FORWARD-MIB — ipCidrRouteTable (RFC 2096, preferred)
+# Index: <dest>.<mask>.<tos>.<nexthop>
+OID_CIDR_ROUTE_DEST     = "1.3.6.1.2.1.4.24.4.1.1"  # destination network
+OID_CIDR_ROUTE_MASK     = "1.3.6.1.2.1.4.24.4.1.2"  # subnet mask
+OID_CIDR_ROUTE_NEXTHOP  = "1.3.6.1.2.1.4.24.4.1.4"  # next-hop IP
+OID_CIDR_ROUTE_IFINDEX  = "1.3.6.1.2.1.4.24.4.1.5"  # ifIndex
+OID_CIDR_ROUTE_TYPE     = "1.3.6.1.2.1.4.24.4.1.6"  # 1=other 3=local 4=remote
+OID_CIDR_ROUTE_PROTO    = "1.3.6.1.2.1.4.24.4.1.9"  # protocol (bgp=13, ospf=9, …)
+OID_CIDR_ROUTE_METRIC   = "1.3.6.1.2.1.4.24.4.1.12" # primary metric
+
+# IP-MIB — ipRouteTable (RFC 1213, legacy fallback)
+# Index: <dest>
+OID_IP_ROUTE_DEST       = "1.3.6.1.2.1.4.21.1.1"
+OID_IP_ROUTE_IFINDEX    = "1.3.6.1.2.1.4.21.1.2"
+OID_IP_ROUTE_METRIC     = "1.3.6.1.2.1.4.21.1.3"
+OID_IP_ROUTE_NEXTHOP    = "1.3.6.1.2.1.4.21.1.7"
+OID_IP_ROUTE_TYPE       = "1.3.6.1.2.1.4.21.1.8"
+OID_IP_ROUTE_PROTO      = "1.3.6.1.2.1.4.21.1.9"
+OID_IP_ROUTE_MASK       = "1.3.6.1.2.1.4.21.1.11"
+
+# BGP4-MIB (RFC 1657)
+OID_BGP_LOCAL_AS        = "1.3.6.1.2.1.15.2.0"        # bgpLocalAs
+OID_BGP_PEER_STATE      = "1.3.6.1.2.1.15.3.1.2"      # bgpPeerState
+OID_BGP_PEER_LOCAL_ADDR = "1.3.6.1.2.1.15.3.1.5"      # bgpPeerLocalAddr
+OID_BGP_PEER_REMOTE_AS  = "1.3.6.1.2.1.15.3.1.9"      # bgpPeerRemoteAs
 
 # DELL-VENDOR-MIB (1.3.6.1.4.1.674) — fallback when ENTITY-MIB is sparse
 # PowerConnect / N-series
@@ -766,6 +798,133 @@ class SNMPCollector:
             if cred.get("version") == 2:
                 patched.append({**cred, "community": cred["community"] + suffix})
         return patched if patched else None
+
+    # ------------------------------------------------------------------
+    # Routing table + BGP
+    # ------------------------------------------------------------------
+
+    def collect_routing(self, info: DeviceInfo) -> None:
+        """
+        Populate *info* with routing table entries and BGP peer data.
+
+        Attempts ipCidrRouteTable (IP-FORWARD-MIB, RFC 2096) first; falls back
+        to the legacy ipRouteTable (IP-MIB, RFC 1213) if the modern table is
+        empty.  BGP local AS and peer table are collected from BGP4-MIB
+        regardless of which routing table source is used.
+        """
+        if_name_map = {iface.index: iface.name for iface in info.interfaces}
+
+        routes = self._collect_cidr_routes(if_name_map)
+        if not routes:
+            log.debug("%s: ipCidrRouteTable empty, trying legacy ipRouteTable",
+                      info.display_name)
+            routes = self._collect_legacy_routes(if_name_map)
+
+        info.routing_table = routes
+        log.debug("%s: collected %d route(s)", info.display_name, len(routes))
+
+        info.bgp_local_as, info.bgp_peers = self._collect_bgp()
+        if info.bgp_local_as:
+            log.debug("%s: BGP local AS %d, %d peer(s)",
+                      info.display_name, info.bgp_local_as, len(info.bgp_peers))
+
+    def _collect_cidr_routes(self, if_name_map: dict[int, str]) -> list[RouteEntry]:
+        """Walk ipCidrRouteTable (IP-FORWARD-MIB)."""
+        dests    = self._walk(OID_CIDR_ROUTE_DEST)
+        if not dests:
+            return []
+        masks    = self._walk(OID_CIDR_ROUTE_MASK)
+        nexthops = self._walk(OID_CIDR_ROUTE_NEXTHOP)
+        if_idxs  = self._walk(OID_CIDR_ROUTE_IFINDEX)
+        protos   = self._walk(OID_CIDR_ROUTE_PROTO)
+        metrics  = self._walk(OID_CIDR_ROUTE_METRIC)
+
+        routes: list[RouteEntry] = []
+        for key, dest in dests.items():
+            mask = masks.get(key, "0.0.0.0")
+            try:
+                prefix_len = _mask_to_prefix(mask)
+            except Exception:
+                continue
+            nexthop  = nexthops.get(key, "0.0.0.0")
+            if_idx   = _safe_int(if_idxs.get(key), default=0)
+            proto_id = _safe_int(protos.get(key), default=0)
+            metric   = _safe_int(metrics.get(key), default=0)
+            protocol = _SNMP_PROTO_MAP.get(proto_id, RouteProtocol.UNKNOWN)
+            routes.append(RouteEntry(
+                destination=dest,
+                prefix_length=prefix_len,
+                next_hop=nexthop,
+                protocol=protocol,
+                if_index=if_idx,
+                if_name=if_name_map.get(if_idx, ""),
+                metric=metric,
+            ))
+        return routes
+
+    def _collect_legacy_routes(self, if_name_map: dict[int, str]) -> list[RouteEntry]:
+        """Walk legacy ipRouteTable (IP-MIB, RFC 1213)."""
+        dests = self._walk(OID_IP_ROUTE_DEST)
+        if not dests:
+            return []
+        masks    = self._walk(OID_IP_ROUTE_MASK)
+        nexthops = self._walk(OID_IP_ROUTE_NEXTHOP)
+        if_idxs  = self._walk(OID_IP_ROUTE_IFINDEX)
+        protos   = self._walk(OID_IP_ROUTE_PROTO)
+        metrics  = self._walk(OID_IP_ROUTE_METRIC)
+
+        routes: list[RouteEntry] = []
+        for key, dest in dests.items():
+            mask = masks.get(key, "0.0.0.0")
+            try:
+                prefix_len = _mask_to_prefix(mask)
+            except Exception:
+                continue
+            nexthop  = nexthops.get(key, "0.0.0.0")
+            if_idx   = _safe_int(if_idxs.get(key), default=0)
+            proto_id = _safe_int(protos.get(key), default=0)
+            metric   = _safe_int(metrics.get(key), default=0)
+            protocol = _SNMP_PROTO_MAP.get(proto_id, RouteProtocol.UNKNOWN)
+            routes.append(RouteEntry(
+                destination=dest,
+                prefix_length=prefix_len,
+                next_hop=nexthop,
+                protocol=protocol,
+                if_index=if_idx,
+                if_name=if_name_map.get(if_idx, ""),
+                metric=metric,
+            ))
+        return routes
+
+    def _collect_bgp(self) -> tuple[Optional[int], list[BgpPeer]]:
+        """Collect BGP local AS and peer table from BGP4-MIB."""
+        local_as_str = self._get(OID_BGP_LOCAL_AS)
+        if not local_as_str:
+            return None, []
+
+        try:
+            local_as = int(local_as_str)
+        except ValueError:
+            return None, []
+
+        if local_as == 0:
+            return None, []
+
+        states     = self._walk(OID_BGP_PEER_STATE)
+        local_addr = self._walk(OID_BGP_PEER_LOCAL_ADDR)
+        remote_as  = self._walk(OID_BGP_PEER_REMOTE_AS)
+
+        peers: list[BgpPeer] = []
+        for peer_ip, state_str in states.items():
+            r_as = _safe_int(remote_as.get(peer_ip), default=0)
+            state_int = _safe_int(state_str, default=0)
+            peers.append(BgpPeer(
+                peer_ip=peer_ip,
+                remote_as=r_as,
+                state=_SNMP_BGP_STATE_MAP.get(state_int, BgpPeerState.UNKNOWN),
+                local_ip=local_addr.get(peer_ip, ""),
+            ))
+        return local_as, peers
 
     # ------------------------------------------------------------------
     # LLDP neighbours

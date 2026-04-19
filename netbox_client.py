@@ -524,6 +524,111 @@ class NetBoxClient:
             ip_obj.update(payload)
 
     # ------------------------------------------------------------------
+    # IPAM — prefixes, ASNs, RIRs
+    # ------------------------------------------------------------------
+
+    _RIR_CACHE: dict[str, object] = {}
+
+    def get_or_create_rir(self, slug: str, name: str) -> Optional[object]:
+        if slug in self._RIR_CACHE:
+            return self._RIR_CACHE[slug]
+        rir = self.nb.ipam.rirs.get(slug=slug)
+        if not rir:
+            log.info("Creating RIR: %s", name)
+            if not self.dry_run:
+                rir = self.nb.ipam.rirs.create({"name": name, "slug": slug})
+        self._RIR_CACHE[slug] = rir
+        return rir
+
+    def get_or_create_asn(self, asn: int, rir_slug: str = "unknown",
+                          description: str = "") -> Optional[object]:
+        """Return the NetBox ASN record for *asn*, creating it if absent."""
+        try:
+            existing = list(self.nb.ipam.asns.filter(asn=asn))
+            if existing:
+                return existing[0]
+        except Exception as exc:
+            log.debug("ASN lookup failed for AS%d: %s", asn, exc)
+            return None
+        rir = self.get_or_create_rir(rir_slug,
+                                      rir_slug.replace("-", " ").title())
+        log.info("Creating ASN: AS%d", asn)
+        if self.dry_run:
+            return None
+        try:
+            payload: dict = {"asn": asn}
+            if rir:
+                payload["rir"] = rir.id
+            if description:
+                payload["description"] = description
+            return self.nb.ipam.asns.create(payload)
+        except Exception as exc:
+            log.error("Could not create ASN AS%d: %s", asn, exc)
+            return None
+
+    def get_prefix(self, prefix: str, vrf_id: Optional[int] = None) -> Optional[object]:
+        params: dict = {"prefix": prefix}
+        if vrf_id is not None:
+            params["vrf_id"] = vrf_id
+        try:
+            results = list(self.nb.ipam.prefixes.filter(**params))
+            return results[0] if results else None
+        except Exception as exc:
+            log.debug("Prefix lookup failed for %s: %s", prefix, exc)
+            return None
+
+    def create_or_update_prefix(
+        self,
+        prefix: str,
+        status: str = "active",
+        description: str = "",
+        vrf_id: Optional[int] = None,
+        site_id: Optional[int] = None,
+        role_slug: Optional[str] = None,
+        tags: Optional[list[str]] = None,
+    ) -> tuple[Optional[object], bool]:
+        """
+        Ensure a prefix record exists for *prefix*.
+
+        Returns (prefix_object, created) where *created* is True if the record
+        was newly inserted.  On dry-run the object is None and *created* reports
+        what would happen.
+        """
+        existing = self.get_prefix(prefix, vrf_id=vrf_id)
+        if existing:
+            updates: dict = {}
+            if description and str(getattr(existing, "description", "")) != description:
+                updates["description"] = description
+            if updates:
+                log.info("UPDATE prefix %s: %s", prefix, updates)
+                if not self.dry_run:
+                    existing.update(updates)
+            return existing, False
+
+        payload: dict = {"prefix": prefix, "status": status}
+        if description:
+            payload["description"] = description
+        if vrf_id is not None:
+            payload["vrf"] = vrf_id
+        if site_id is not None:
+            payload["site"] = site_id
+        if role_slug:
+            role = self.nb.ipam.roles.get(slug=role_slug)
+            if role:
+                payload["role"] = role.id
+        if tags:
+            payload["tags"] = [{"slug": s} for s in tags]
+
+        log.info("CREATE prefix: %s (%s)", prefix, status)
+        if self.dry_run:
+            return None, True
+        try:
+            return self.nb.ipam.prefixes.create(payload), True
+        except Exception as exc:
+            log.error("Could not create prefix %s: %s", prefix, exc)
+            return None, False
+
+    # ------------------------------------------------------------------
     # Meraki
     # ------------------------------------------------------------------
 

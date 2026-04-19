@@ -104,6 +104,82 @@ class StackMember:
     os_version: str = ""
 
 
+class RouteProtocol(str, Enum):
+    OTHER   = "other"
+    LOCAL   = "local"    # connected interface route
+    STATIC  = "static"   # statically configured
+    OSPF    = "ospf"
+    ISIS    = "isis"
+    BGP     = "bgp"
+    UNKNOWN = "unknown"
+
+
+# ipRouteProto / ipCidrRouteProto integer values → RouteProtocol
+_SNMP_PROTO_MAP: dict[int, "RouteProtocol"] = {
+    1:  RouteProtocol.OTHER,
+    2:  RouteProtocol.LOCAL,    # local / direct
+    3:  RouteProtocol.STATIC,   # netmgmt / static
+    4:  RouteProtocol.LOCAL,    # icmp redirect → treat as local
+    9:  RouteProtocol.OSPF,
+    13: RouteProtocol.BGP,
+    14: RouteProtocol.ISIS,
+}
+
+
+@dataclass
+class RouteEntry:
+    """A single entry from the IP routing table (ipCidrRouteTable / ipRouteTable)."""
+    destination: str        # network address, e.g. "10.0.0.0"
+    prefix_length: int      # e.g. 24
+    next_hop: str           # e.g. "192.168.1.1"; "0.0.0.0" means connected
+    protocol: RouteProtocol = RouteProtocol.UNKNOWN
+    if_index: int = 0
+    if_name: str = ""       # resolved from interface list after collection
+    metric: int = 0
+    vrf: str = ""           # "" = global / default VRF
+
+    @property
+    def prefix(self) -> str:
+        return f"{self.destination}/{self.prefix_length}"
+
+    @property
+    def is_connected(self) -> bool:
+        return self.next_hop in ("0.0.0.0", "") or self.protocol == RouteProtocol.LOCAL
+
+
+class BgpPeerState(str, Enum):
+    IDLE         = "idle"
+    CONNECT      = "connect"
+    ACTIVE       = "active"
+    OPEN_SENT    = "opensent"
+    OPEN_CONFIRM = "openconfirm"
+    ESTABLISHED  = "established"
+    UNKNOWN      = "unknown"
+
+
+_SNMP_BGP_STATE_MAP: dict[int, "BgpPeerState"] = {
+    1: BgpPeerState.IDLE,
+    2: BgpPeerState.CONNECT,
+    3: BgpPeerState.ACTIVE,
+    4: BgpPeerState.OPEN_SENT,
+    5: BgpPeerState.OPEN_CONFIRM,
+    6: BgpPeerState.ESTABLISHED,
+}
+
+
+@dataclass
+class BgpPeer:
+    """A single BGP peer from bgpPeerTable (BGP4-MIB, RFC 1657)."""
+    peer_ip: str
+    remote_as: int
+    state: BgpPeerState = BgpPeerState.UNKNOWN
+    local_ip: str = ""
+
+    @property
+    def is_established(self) -> bool:
+        return self.state == BgpPeerState.ESTABLISHED
+
+
 @dataclass
 class DeviceInfo:
     """Top-level information about a queried device."""
@@ -119,6 +195,10 @@ class DeviceInfo:
     mac_table: list[MacTableEntry] = field(default_factory=list)
     site_id: Optional[int] = None  # override IPAM site resolution when set
     stack_members: list[StackMember] = field(default_factory=list)
+    # Routing / BGP data — populated by SNMPCollector.collect_routing()
+    routing_table: list[RouteEntry] = field(default_factory=list)
+    bgp_local_as: Optional[int] = None
+    bgp_peers: list[BgpPeer] = field(default_factory=list)
 
     @property
     def display_name(self) -> str:

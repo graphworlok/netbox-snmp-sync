@@ -35,7 +35,7 @@ from rich import print as rprint
 import config
 import discovery
 import sync as sync_mod
-from models import ChangeKind, DriftReport
+from models import ChangeKind, DeviceInfo, DriftReport, RouteProtocol
 from netbox_client import NetBoxClient
 
 console = Console()
@@ -366,6 +366,130 @@ def cmd_sync(ips, ip_file, depth, no_discover, slow, verbose, dry_run, no_create
         )
 
 
+@cli.command("routing")
+@_add_options(_common_options)
+@click.option("--dry-run", is_flag=True,
+              help="Compute changes but do not write to NetBox.")
+@click.option("--protocol", "protocols",
+              multiple=True,
+              type=click.Choice(["bgp", "ospf", "static", "local", "isis", "all"],
+                                case_sensitive=False),
+              default=["all"],
+              show_default=True,
+              help="Route protocol(s) to sync into IPAM. Repeat to include multiple.")
+@click.option("--max-prefix-len", default=30, show_default=True,
+              help="Skip routes with a prefix length longer than this "
+                   "(avoids flooding IPAM with /32 host routes).")
+@click.option("--no-bgp-asns", is_flag=True,
+              help="Skip writing ASN records for BGP local AS and peers.")
+@click.option("--rir", "rir_slug", default="unknown", show_default=True,
+              help="RIR slug to assign to created ASN records.")
+def cmd_routing(ips, ip_file, depth, no_discover, slow, verbose,
+                dry_run, protocols, max_prefix_len, no_bgp_asns, rir_slug):
+    """Collect routing tables and BGP data via SNMP and sync into NetBox IPAM."""
+    _setup_logging(verbose)
+    _print_integration_status()
+
+    if no_discover:
+        config.AUTO_DISCOVER_NEIGHBORS = False
+    if slow:
+        config.SNMP_TIMEOUT = config.SNMP_TIMEOUT_SLOW
+        config.SNMP_RETRIES = config.SNMP_RETRIES_SLOW
+        console.print(f"[yellow]--slow: SNMP timeout={config.SNMP_TIMEOUT}s  retries={config.SNMP_RETRIES}[/yellow]")
+
+    seed = _collect_seed_ips(ips, ip_file)
+    disc = discovery.run(seed, max_depth=depth)
+    _print_discovery_summary(disc)
+
+    # Collect routing and BGP data on top of the already-collected DeviceInfo
+    from snmp_collector import SNMPCollector
+    console.print("\n[bold]Collecting routing tables and BGP data…[/bold]")
+    for device in disc.collected:
+        creds = getattr(config, "SNMP_CREDENTIALS", [])
+        port = getattr(config, "SNMP_PORT", 161)
+        timeout = config.SNMP_TIMEOUT if not slow else config.SNMP_TIMEOUT_SLOW
+        retries = config.SNMP_RETRIES if not slow else config.SNMP_RETRIES_SLOW
+        collector = SNMPCollector(device.query_ip, creds, port=port,
+                                  timeout=timeout, retries=retries)
+        try:
+            collector.collect_routing(device)
+        except Exception as exc:
+            log.warning("Routing collection failed for %s: %s",
+                        device.display_name, exc)
+
+    _print_routing_summary(disc.collected)
+
+    # Resolve protocol filter
+    proto_filter: set[RouteProtocol] | None = None
+    if "all" not in [p.lower() for p in protocols]:
+        _proto_map = {
+            "bgp":    RouteProtocol.BGP,
+            "ospf":   RouteProtocol.OSPF,
+            "static": RouteProtocol.STATIC,
+            "local":  RouteProtocol.LOCAL,
+            "isis":   RouteProtocol.ISIS,
+        }
+        proto_filter = {_proto_map[p.lower()] for p in protocols
+                        if p.lower() in _proto_map}
+
+    nb = NetBoxClient(config.NETBOX_URL, config.NETBOX_TOKEN, dry_run=dry_run)
+
+    # Ensure required IPAM tags exist
+    _ensure_snmp_sync_tag(nb)
+
+    console.print("\n[bold]Syncing prefixes to IPAM…[/bold]")
+    prefix_totals = sync_mod.sync_routing_table(
+        disc.collected,
+        nb,
+        protocols=proto_filter,
+        max_prefix_len=max_prefix_len,
+        dry_run=dry_run,
+    )
+
+    asn_totals: dict = {"created": 0, "existing": 0}
+    if not no_bgp_asns:
+        console.print("[bold]Syncing ASN records…[/bold]")
+        asn_totals = sync_mod.sync_asns(
+            disc.collected,
+            nb,
+            rir_slug=rir_slug,
+            dry_run=dry_run,
+        )
+
+    if dry_run:
+        console.print(
+            f"\n[yellow]Dry-run mode — no changes written.\n"
+            f"  Prefixes: {prefix_totals['created']} would be created, "
+            f"{prefix_totals['updated']} already exist, "
+            f"{prefix_totals['skipped']} skipped.\n"
+            f"  ASNs: {asn_totals['created']} would be created, "
+            f"{asn_totals['existing']} already exist.[/yellow]"
+        )
+    else:
+        console.print(
+            f"\n[green]Done.\n"
+            f"  Prefixes: {prefix_totals['created']} created, "
+            f"{prefix_totals['updated']} already existed, "
+            f"{prefix_totals['skipped']} skipped.\n"
+            f"  ASNs: {asn_totals['created']} created, "
+            f"{asn_totals['existing']} already existed.[/green]"
+        )
+
+
+def _ensure_snmp_sync_tag(nb: NetBoxClient) -> None:
+    """Create the 'snmp-sync' and 'bgp-learned' tags in NetBox if absent."""
+    for tag in (
+        {"name": "snmp-sync",    "slug": "snmp-sync",    "color": "2196f3"},
+        {"name": "bgp-learned",  "slug": "bgp-learned",  "color": "4caf50"},
+    ):
+        try:
+            if not nb.nb.extras.tags.get(slug=tag["slug"]):
+                if not nb.dry_run:
+                    nb.nb.extras.tags.create(tag)
+        except Exception as exc:
+            log.debug("Could not ensure tag %s: %s", tag["slug"], exc)
+
+
 # ---------------------------------------------------------------------------
 # Output helpers
 # ---------------------------------------------------------------------------
@@ -407,6 +531,41 @@ def _print_discovery_summary(disc: discovery.DiscoveryResult) -> None:
         for ip in disc.unreachable:
             t.add_row(ip)
         console.print(t)
+
+
+def _print_routing_summary(devices: list[DeviceInfo]) -> None:
+    from models import RouteProtocol
+
+    devices_with_routes = [d for d in devices if d.routing_table]
+    if not devices_with_routes:
+        console.print("[yellow]No routing table data collected.[/yellow]")
+        return
+
+    t = Table(title="Routing table summary", show_lines=True)
+    t.add_column("Device", style="bold")
+    t.add_column("Routes", justify="right")
+    t.add_column("BGP", style="green", justify="right")
+    t.add_column("OSPF", justify="right")
+    t.add_column("Static", justify="right")
+    t.add_column("Local", justify="right")
+    t.add_column("Local AS")
+    t.add_column("BGP Peers", justify="right")
+
+    for device in devices_with_routes:
+        by_proto: dict[str, int] = {}
+        for r in device.routing_table:
+            by_proto[r.protocol.value] = by_proto.get(r.protocol.value, 0) + 1
+        t.add_row(
+            device.display_name,
+            str(len(device.routing_table)),
+            str(by_proto.get("bgp", 0)),
+            str(by_proto.get("ospf", 0)),
+            str(by_proto.get("static", 0)),
+            str(by_proto.get("local", 0)),
+            str(device.bgp_local_as or "—"),
+            str(len(device.bgp_peers)),
+        )
+    console.print(t)
 
 
 def _print_drift_table(reports: list[DriftReport]) -> None:
