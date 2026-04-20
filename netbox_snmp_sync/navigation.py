@@ -68,7 +68,7 @@ menu = PluginMenu(
                             link="plugins:netbox_snmp_sync:credential_add",
                             title="Add credential",
                             icon_class="mdi mdi-plus-thick",
-                            color=PluginMenuButton.GREEN,
+                            color="green",
                         ),
                     ),
                 ),
