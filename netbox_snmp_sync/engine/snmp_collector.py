@@ -441,7 +441,13 @@ class SNMPCollector:
         return results
 
     async def _async_walk(self, oid: str) -> dict[str, str]:
-        """Async variant of _walk for pysnmp 6.x."""
+        """
+        Async BULK walk for pysnmp 7.x.
+
+        pysnmp 7.x bulk_cmd performs a single BULK request and returns one
+        tuple (err, err_status, idx, var_binds).  We loop manually, advancing
+        the start OID each iteration until we leave the target subtree.
+        """
         for cred in self._cred_list():
             cred_name = cred.get("name", "?")
             auth = _make_auth(cred)
@@ -450,31 +456,44 @@ class SNMPCollector:
             log.debug("SNMP WALK %s  oid=%s  cred=%s  timeout=%ds  retries=%d",
                       self.host, oid, cred_name, self.timeout, self.retries)
             t0 = time.monotonic()
+            results: dict[str, str] = {}
             success = False
             last_error: str = ""
-            results: dict[str, str] = {}
-            _bulk_iter = await bulkCmd(
-                SnmpEngine(), auth, transport, ContextData(),
-                0, 25,
-                ObjectType(ObjectIdentity(oid)),
-                lexicographicMode=False,
-            )
-            async for (err_ind, err_status, _, var_binds) in _bulk_iter:
+            engine = SnmpEngine()
+            next_oid = oid
+
+            while True:
+                err_ind, err_status, _, var_binds = await bulkCmd(
+                    engine, auth, transport, ContextData(),
+                    0, 25,
+                    ObjectType(ObjectIdentity(next_oid)),
+                )
                 if err_ind:
                     last_error = str(err_ind)
                     break
                 if err_status:
                     last_error = err_status.prettyPrint()
                     break
-                success = True
+                if not var_binds:
+                    break
+
+                past_subtree = False
                 for obj_name, val in var_binds:
                     oid_str = str(obj_name)
+                    # Stop if we've walked past the target subtree
+                    if not (oid_str == oid or oid_str.startswith(oid + ".")):
+                        past_subtree = True
+                        break
                     suffix = oid_str[len(oid):].lstrip(".")
                     results[suffix] = (
-                        val.prettyPrint()
-                        if hasattr(val, "prettyPrint")
-                        else str(val)
+                        val.prettyPrint() if hasattr(val, "prettyPrint") else str(val)
                     )
+                    success = True
+                    next_oid = oid_str  # advance cursor for next request
+
+                if past_subtree:
+                    break
+
             elapsed = time.monotonic() - t0
             if success:
                 self._working_cred = cred
