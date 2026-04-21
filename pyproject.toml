@@ -17,3 +17,6 @@ dev = ["pytest", "pytest-django"]
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["netbox_snmp_sync*"]
+
+[tool.setuptools.package-data]
+netbox_snmp_sync = ["templates/**/*.html"]
