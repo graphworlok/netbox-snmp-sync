@@ -453,12 +453,13 @@ class SNMPCollector:
             success = False
             last_error: str = ""
             results: dict[str, str] = {}
-            async for (err_ind, err_status, _, var_binds) in bulkCmd(
+            _bulk_iter = await bulkCmd(
                 SnmpEngine(), auth, transport, ContextData(),
                 0, 25,
                 ObjectType(ObjectIdentity(oid)),
                 lexicographicMode=False,
-            ):
+            )
+            async for (err_ind, err_status, _, var_binds) in _bulk_iter:
                 if err_ind:
                     last_error = str(err_ind)
                     break
