@@ -16,34 +16,77 @@ Supported platforms: Cisco IOS, IOS-XE, IOS XR, NX-OS, ASA,
 
 from __future__ import annotations
 
+import asyncio as _asyncio
+import inspect as _inspect
 import logging
 import re
 import socket
 import time
 from typing import Optional
 
-from pysnmp.hlapi import (
-    CommunityData,
-    ContextData,
-    ObjectIdentity,
-    ObjectType,
-    SnmpEngine,
-    UdpTransportTarget,
-    UsmUserData,
-    bulkCmd,
-    getCmd,
-    usmAesCfb128Protocol,
-    usmAesCfb192Protocol,
-    usmAesCfb256Protocol,
-    usmDESPrivProtocol,
-    usmHMACMD5AuthProtocol,
-    usmHMACSHAAuthProtocol,
-    usmHMAC128SHA224AuthProtocol,
-    usmHMAC192SHA256AuthProtocol,
-    usmHMAC256SHA384AuthProtocol,
-    usmHMAC384SHA512AuthProtocol,
-    usmNoAuthProtocol,
-    usmNoPrivProtocol,
+# ---------------------------------------------------------------------------
+# pysnmp version compatibility
+#
+# pysnmp 4.x/5.x: synchronous generator API via pysnmp.hlapi
+# pysnmp 6.x:     async-only API; pysnmp.hlapi is a namespace package and
+#                  CommunityData / getCmd / bulkCmd live in sub-modules.
+# ---------------------------------------------------------------------------
+try:
+    from pysnmp.hlapi import (
+        CommunityData,
+        ContextData,
+        ObjectIdentity,
+        ObjectType,
+        SnmpEngine,
+        UdpTransportTarget,
+        UsmUserData,
+        bulkCmd,
+        getCmd,
+        usmAesCfb128Protocol,
+        usmAesCfb192Protocol,
+        usmAesCfb256Protocol,
+        usmDESPrivProtocol,
+        usmHMACMD5AuthProtocol,
+        usmHMACSHAAuthProtocol,
+        usmHMAC128SHA224AuthProtocol,
+        usmHMAC192SHA256AuthProtocol,
+        usmHMAC256SHA384AuthProtocol,
+        usmHMAC384SHA512AuthProtocol,
+        usmNoAuthProtocol,
+        usmNoPrivProtocol,
+    )
+except ImportError:
+    # pysnmp 6.x — import from specific sub-modules
+    from pysnmp.hlapi.v3arch.asyncio import (  # type: ignore[no-redef]
+        CommunityData,
+        ContextData,
+        ObjectIdentity,
+        ObjectType,
+        SnmpEngine,
+        UdpTransportTarget,
+        UsmUserData,
+        bulkCmd,
+        getCmd,
+        usmAesCfb128Protocol,
+        usmAesCfb192Protocol,
+        usmAesCfb256Protocol,
+        usmDESPrivProtocol,
+        usmHMACMD5AuthProtocol,
+        usmHMACSHAAuthProtocol,
+        usmHMAC128SHA224AuthProtocol,
+        usmHMAC192SHA256AuthProtocol,
+        usmHMAC256SHA384AuthProtocol,
+        usmHMAC384SHA512AuthProtocol,
+        usmNoAuthProtocol,
+        usmNoPrivProtocol,
+    )
+
+# True when getCmd / bulkCmd are async (pysnmp 6.x)
+_PYSNMP_ASYNC: bool = _inspect.iscoroutinefunction(getCmd)
+# True when UdpTransportTarget must be awaited via .create() (pysnmp 6.x)
+_TRANSPORT_ASYNC: bool = (
+    hasattr(UdpTransportTarget, "create")
+    and _inspect.iscoroutinefunction(UdpTransportTarget.create)
 )
 
 from .data_models import (
@@ -231,6 +274,24 @@ def _transport(host: str, port: int, timeout: int, retries: int):
     return UdpTransportTarget((host, port), timeout=timeout, retries=retries)
 
 
+async def _transport_async(host: str, port: int, timeout: int, retries: int):
+    if _TRANSPORT_ASYNC:
+        return await UdpTransportTarget.create((host, port), timeout=timeout, retries=retries)
+    return UdpTransportTarget((host, port), timeout=timeout, retries=retries)
+
+
+def _run_async(coro):
+    """Run an async coroutine synchronously (used in pysnmp 6.x mode)."""
+    try:
+        _asyncio.get_running_loop()
+        # Already inside an async context; use a new thread to avoid deadlock.
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(_asyncio.run, coro).result()
+    except RuntimeError:
+        return _asyncio.run(coro)
+
+
 # ---------------------------------------------------------------------------
 # SNMPCollector
 # ---------------------------------------------------------------------------
@@ -270,6 +331,8 @@ class SNMPCollector:
 
     def _get(self, oid: str) -> Optional[object]:
         """GET a single scalar OID, trying credentials in order."""
+        if _PYSNMP_ASYNC:
+            return _run_async(self._async_get(oid))
         for cred in self._cred_list():
             cred_name = cred.get("name", "?")
             auth = _make_auth(cred)
@@ -300,11 +363,45 @@ class SNMPCollector:
         log.debug("SNMP GET  %s  oid=%s  all credentials exhausted — unreachable", self.host, oid)
         return None
 
+    async def _async_get(self, oid: str) -> Optional[object]:
+        """Async variant of _get for pysnmp 6.x."""
+        for cred in self._cred_list():
+            cred_name = cred.get("name", "?")
+            auth = _make_auth(cred)
+            transport = await _transport_async(self.host, self.port,
+                                               self.timeout, self.retries)
+            log.debug("SNMP GET  %s  oid=%s  cred=%s  timeout=%ds  retries=%d",
+                      self.host, oid, cred_name, self.timeout, self.retries)
+            t0 = time.monotonic()
+            error_indication, error_status, _, var_binds = await getCmd(
+                SnmpEngine(), auth, transport, ContextData(),
+                ObjectType(ObjectIdentity(oid))
+            )
+            elapsed = time.monotonic() - t0
+            if error_indication:
+                log.debug("SNMP GET  %s  oid=%s  cred=%s  FAILED (%.2fs): %s",
+                          self.host, oid, cred_name, elapsed, error_indication)
+                continue
+            if error_status:
+                log.debug("SNMP GET  %s  oid=%s  cred=%s  ERROR (%.2fs): %s",
+                          self.host, oid, cred_name, elapsed, error_status.prettyPrint())
+                continue
+            self._working_cred = cred
+            val = var_binds[0][1]
+            result = val.prettyPrint() if hasattr(val, "prettyPrint") else str(val)
+            log.debug("SNMP GET  %s  oid=%s  cred=%s  OK (%.2fs): %r",
+                      self.host, oid, cred_name, elapsed, result[:80] if result else result)
+            return result
+        log.debug("SNMP GET  %s  oid=%s  all credentials exhausted — unreachable", self.host, oid)
+        return None
+
     def _walk(self, oid: str) -> dict[str, str]:
         """
         BULK walk a table OID.  Returns {last_oid_component: value_str}.
         Tries credentials in order; stops at first working credential.
         """
+        if _PYSNMP_ASYNC:
+            return _run_async(self._async_walk(oid))
         results: dict[str, str] = {}
         for cred in self._cred_list():
             cred_name = cred.get("name", "?")
@@ -347,6 +444,50 @@ class SNMPCollector:
                 log.debug("SNMP WALK %s  oid=%s  cred=%s  FAILED (%.2fs): %s",
                           self.host, oid, cred_name, elapsed, last_error or "no data")
         return results
+
+    async def _async_walk(self, oid: str) -> dict[str, str]:
+        """Async variant of _walk for pysnmp 6.x."""
+        for cred in self._cred_list():
+            cred_name = cred.get("name", "?")
+            auth = _make_auth(cred)
+            transport = await _transport_async(self.host, self.port,
+                                               self.timeout, self.retries)
+            log.debug("SNMP WALK %s  oid=%s  cred=%s  timeout=%ds  retries=%d",
+                      self.host, oid, cred_name, self.timeout, self.retries)
+            t0 = time.monotonic()
+            success = False
+            last_error: str = ""
+            results: dict[str, str] = {}
+            async for (err_ind, err_status, _, var_binds) in bulkCmd(
+                SnmpEngine(), auth, transport, ContextData(),
+                0, 25,
+                ObjectType(ObjectIdentity(oid)),
+                lexicographicMode=False,
+            ):
+                if err_ind:
+                    last_error = str(err_ind)
+                    break
+                if err_status:
+                    last_error = err_status.prettyPrint()
+                    break
+                success = True
+                for obj_name, val in var_binds:
+                    oid_str = str(obj_name)
+                    suffix = oid_str[len(oid):].lstrip(".")
+                    results[suffix] = (
+                        val.prettyPrint()
+                        if hasattr(val, "prettyPrint")
+                        else str(val)
+                    )
+            elapsed = time.monotonic() - t0
+            if success:
+                self._working_cred = cred
+                log.debug("SNMP WALK %s  oid=%s  cred=%s  OK (%.2fs): %d row(s)",
+                          self.host, oid, cred_name, elapsed, len(results))
+                return results
+            log.debug("SNMP WALK %s  oid=%s  cred=%s  FAILED (%.2fs): %s",
+                      self.host, oid, cred_name, elapsed, last_error or "no data")
+        return {}
 
     def _cred_list(self) -> list[dict]:
         """Put the last working credential first to avoid unnecessary retries."""
