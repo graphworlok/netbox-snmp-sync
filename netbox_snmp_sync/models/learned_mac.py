@@ -44,7 +44,12 @@ class LearnedMAC(models.Model):
     class Meta:
         ordering = ["-last_seen"]
         # A MAC can appear on multiple devices (e.g. on uplink ports of two switches)
-        unique_together = [("mac_address", "source_device_ip")]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["mac_address", "source_device_ip"],
+                name="unique_mac_per_device",
+            )
+        ]
         verbose_name = "Learned MAC"
         verbose_name_plural = "Learned MACs"
 
