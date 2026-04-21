@@ -9,6 +9,7 @@ description = "NetBox plugin to discover and sync devices via SNMP"
 requires-python = ">=3.10"
 dependencies = [
     "pysnmp>=6.0",
+    "pynetbox",
 ]
 
 [project.optional-dependencies]
