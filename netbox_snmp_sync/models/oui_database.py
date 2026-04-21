@@ -2,11 +2,14 @@ import os
 
 from django.db import models
 from django.urls import reverse
+from utilities.queryset import RestrictedQuerySet
 
 from ..choices import OUIRegistryChoices
 
 
 class OUIDatabase(models.Model):
+    objects = RestrictedQuerySet.as_manager()
+
     """
     One row per IEEE OUI registry (MA-L, MA-M, MA-S).
     Tracks where the file is stored, when it was last downloaded, and how many

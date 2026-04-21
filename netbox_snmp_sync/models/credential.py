@@ -1,10 +1,13 @@
 from django.db import models
 from django.urls import reverse
+from utilities.queryset import RestrictedQuerySet
 
 from ..choices import SNMPVersionChoices, SNMPAuthProtocolChoices, SNMPPrivProtocolChoices
 
 
 class SNMPCredential(models.Model):
+    objects = RestrictedQuerySet.as_manager()
+
     """
     An SNMP credential profile tried in priority order during device polling.
     Credentials are tried lowest priority value first (0 = highest priority).

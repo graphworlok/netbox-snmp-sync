@@ -1,11 +1,14 @@
 from django.db import models
 from django.urls import reverse
 from django.utils import timezone
+from utilities.queryset import RestrictedQuerySet
 
 from ..choices import LearnedMACStatusChoices, MACEntryTypeChoices
 
 
 class LearnedMAC(models.Model):
+    objects = RestrictedQuerySet.as_manager()
+
     """
     A MAC address learned from a device's SNMP bridge forwarding table.
     Records accumulate across sync runs; status reflects the most recent run.

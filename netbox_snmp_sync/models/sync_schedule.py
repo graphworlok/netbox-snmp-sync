@@ -1,8 +1,11 @@
 from django.db import models
 from django.urls import reverse
+from utilities.queryset import RestrictedQuerySet
 
 
 class SyncSchedule(models.Model):
+    objects = RestrictedQuerySet.as_manager()
+
     """
     Singleton model storing the SNMP sync schedule and seed configuration.
     Only one row should exist (pk=1); views use get_or_create to enforce this.
