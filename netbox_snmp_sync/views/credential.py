@@ -67,4 +67,4 @@ class SNMPCredentialDeleteView(View):
         name = obj.name
         obj.delete()
         messages.success(request, f"SNMP credential '{name}' deleted.")
-        return redirect("plugins:netbox_snmp_sync:credential_list")
+        return redirect("plugins:netbox_snmp_sync:snmpcredential_list")

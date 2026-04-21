@@ -9,12 +9,12 @@ urlpatterns = [
     path("sync-logs/",               views.SyncLogListView.as_view(),          name="synclog_list"),
     path("sync-logs/<int:pk>/",      views.SyncLogView.as_view(),              name="synclog"),
 
-    # SNMP credentials
-    path("credentials/",             views.SNMPCredentialListView.as_view(),   name="credential_list"),
-    path("credentials/add/",         views.SNMPCredentialEditView.as_view(),   name="credential_add"),
-    path("credentials/<int:pk>/",    views.SNMPCredentialView.as_view(),       name="credential"),
-    path("credentials/<int:pk>/edit/",   views.SNMPCredentialEditView.as_view(),   name="credential_edit"),
-    path("credentials/<int:pk>/delete/", views.SNMPCredentialDeleteView.as_view(), name="credential_delete"),
+    # SNMP credentials — names follow NetBox convention: {modelname}_{action}
+    path("credentials/",             views.SNMPCredentialListView.as_view(),   name="snmpcredential_list"),
+    path("credentials/add/",         views.SNMPCredentialEditView.as_view(),   name="snmpcredential_add"),
+    path("credentials/<int:pk>/",    views.SNMPCredentialView.as_view(),       name="snmpcredential"),
+    path("credentials/<int:pk>/edit/",   views.SNMPCredentialEditView.as_view(),   name="snmpcredential_edit"),
+    path("credentials/<int:pk>/delete/", views.SNMPCredentialDeleteView.as_view(), name="snmpcredential_delete"),
 
     # Learned MACs
     path("learned-macs/",                  views.LearnedMACListView.as_view(),   name="learned_mac_list"),

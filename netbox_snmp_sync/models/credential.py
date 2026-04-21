@@ -65,7 +65,7 @@ class SNMPCredential(models.Model):
         return f"{self.name} (v{self.version})"
 
     def get_absolute_url(self) -> str:
-        return reverse("plugins:netbox_snmp_sync:credential", args=[self.pk])
+        return reverse("plugins:netbox_snmp_sync:snmpcredential", args=[self.pk])
 
     def get_version_color(self) -> str:
         return SNMPVersionChoices.colors.get(self.version, "secondary")
