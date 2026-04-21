@@ -1,12 +1,11 @@
 from django.db import models
 from django.urls import reverse
-from utilities.queryset import RestrictedQuerySet
-
 from ..choices import SyncStatusChoices
+from .querysets import PluginQuerySet
 
 
 class SyncLog(models.Model):
-    objects = RestrictedQuerySet.as_manager()
+    objects = PluginQuerySet.as_manager()
 
     started_at   = models.DateTimeField(auto_now_add=True, db_index=True)
     completed_at = models.DateTimeField(null=True, blank=True)

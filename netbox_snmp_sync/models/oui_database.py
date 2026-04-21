@@ -2,13 +2,12 @@ import os
 
 from django.db import models
 from django.urls import reverse
-from utilities.queryset import RestrictedQuerySet
-
 from ..choices import OUIRegistryChoices
+from .querysets import PluginQuerySet
 
 
 class OUIDatabase(models.Model):
-    objects = RestrictedQuerySet.as_manager()
+    objects = PluginQuerySet.as_manager()
 
     """
     One row per IEEE OUI registry (MA-L, MA-M, MA-S).
