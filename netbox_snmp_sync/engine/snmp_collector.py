@@ -28,58 +28,53 @@ from typing import Optional
 # pysnmp version compatibility
 #
 # pysnmp 4.x/5.x: synchronous generator API via pysnmp.hlapi
-# pysnmp 6.x:     async-only API; pysnmp.hlapi is a namespace package and
-#                  CommunityData / getCmd / bulkCmd live in sub-modules.
+# pysnmp 6.x:     async-only; pysnmp.hlapi is a namespace, use sub-modules;
+#                  camelCase names (getCmd, bulkCmd) still present.
+# pysnmp 7.x:     same sub-modules but renamed to snake_case (get_cmd,
+#                  bulk_cmd).  All three tiers are tried in order.
 # ---------------------------------------------------------------------------
+_COMMON_NAMES = (
+    "CommunityData", "ContextData", "ObjectIdentity", "ObjectType",
+    "SnmpEngine", "UdpTransportTarget", "UsmUserData",
+    "usmAesCfb128Protocol", "usmAesCfb192Protocol", "usmAesCfb256Protocol",
+    "usmDESPrivProtocol", "usmHMACMD5AuthProtocol", "usmHMACSHAAuthProtocol",
+    "usmHMAC128SHA224AuthProtocol", "usmHMAC192SHA256AuthProtocol",
+    "usmHMAC256SHA384AuthProtocol", "usmHMAC384SHA512AuthProtocol",
+    "usmNoAuthProtocol", "usmNoPrivProtocol",
+)
+
 try:
+    # Tier 1: pysnmp 4.x / 5.x — synchronous hlapi
     from pysnmp.hlapi import (
-        CommunityData,
-        ContextData,
-        ObjectIdentity,
-        ObjectType,
-        SnmpEngine,
-        UdpTransportTarget,
-        UsmUserData,
-        bulkCmd,
-        getCmd,
-        usmAesCfb128Protocol,
-        usmAesCfb192Protocol,
-        usmAesCfb256Protocol,
-        usmDESPrivProtocol,
-        usmHMACMD5AuthProtocol,
-        usmHMACSHAAuthProtocol,
-        usmHMAC128SHA224AuthProtocol,
-        usmHMAC192SHA256AuthProtocol,
-        usmHMAC256SHA384AuthProtocol,
-        usmHMAC384SHA512AuthProtocol,
-        usmNoAuthProtocol,
-        usmNoPrivProtocol,
+        CommunityData, ContextData, ObjectIdentity, ObjectType,
+        SnmpEngine, UdpTransportTarget, UsmUserData,
+        bulkCmd, getCmd,
+        usmAesCfb128Protocol, usmAesCfb192Protocol, usmAesCfb256Protocol,
+        usmDESPrivProtocol, usmHMACMD5AuthProtocol, usmHMACSHAAuthProtocol,
+        usmHMAC128SHA224AuthProtocol, usmHMAC192SHA256AuthProtocol,
+        usmHMAC256SHA384AuthProtocol, usmHMAC384SHA512AuthProtocol,
+        usmNoAuthProtocol, usmNoPrivProtocol,
     )
 except ImportError:
-    # pysnmp 6.x — import from specific sub-modules
+    # Tier 2 / 3: pysnmp 6.x or 7.x — import from v3arch asyncio sub-module
     from pysnmp.hlapi.v3arch.asyncio import (  # type: ignore[no-redef]
-        CommunityData,
-        ContextData,
-        ObjectIdentity,
-        ObjectType,
-        SnmpEngine,
-        UdpTransportTarget,
-        UsmUserData,
-        bulkCmd,
-        getCmd,
-        usmAesCfb128Protocol,
-        usmAesCfb192Protocol,
-        usmAesCfb256Protocol,
-        usmDESPrivProtocol,
-        usmHMACMD5AuthProtocol,
-        usmHMACSHAAuthProtocol,
-        usmHMAC128SHA224AuthProtocol,
-        usmHMAC192SHA256AuthProtocol,
-        usmHMAC256SHA384AuthProtocol,
-        usmHMAC384SHA512AuthProtocol,
-        usmNoAuthProtocol,
-        usmNoPrivProtocol,
+        CommunityData, ContextData, ObjectIdentity, ObjectType,
+        SnmpEngine, UdpTransportTarget, UsmUserData,
+        usmAesCfb128Protocol, usmAesCfb192Protocol, usmAesCfb256Protocol,
+        usmDESPrivProtocol, usmHMACMD5AuthProtocol, usmHMACSHAAuthProtocol,
+        usmHMAC128SHA224AuthProtocol, usmHMAC192SHA256AuthProtocol,
+        usmHMAC256SHA384AuthProtocol, usmHMAC384SHA512AuthProtocol,
+        usmNoAuthProtocol, usmNoPrivProtocol,
     )
+    try:
+        # Tier 2: pysnmp 6.x — camelCase command names
+        from pysnmp.hlapi.v3arch.asyncio import bulkCmd, getCmd  # type: ignore[no-redef]
+    except ImportError:
+        # Tier 3: pysnmp 7.x — snake_case command names; alias to camelCase
+        from pysnmp.hlapi.v3arch.asyncio import (  # type: ignore[no-redef]
+            bulk_cmd as bulkCmd,
+            get_cmd as getCmd,
+        )
 
 # True when getCmd / bulkCmd are async (pysnmp 6.x)
 _PYSNMP_ASYNC: bool = _inspect.iscoroutinefunction(getCmd)
