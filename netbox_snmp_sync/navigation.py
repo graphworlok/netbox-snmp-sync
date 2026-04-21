@@ -61,11 +61,11 @@ menu = PluginMenu(
             "Configuration",
             (
                 PluginMenuItem(
-                    link="plugins:netbox_snmp_sync:credential_list",
+                    link="plugins:netbox_snmp_sync:snmpcredential_list",
                     link_text="SNMP Credentials",
                     buttons=(
                         PluginMenuButton(
-                            link="plugins:netbox_snmp_sync:credential_add",
+                            link="plugins:netbox_snmp_sync:snmpcredential_add",
                             title="Add credential",
                             icon_class="mdi mdi-plus-thick",
                             color="green",
