@@ -13,6 +13,7 @@ class SyncLogTable(NetBoxTable):
     devices_updated   = tables.Column(verbose_name="Updated")
     interfaces_synced = tables.Column(verbose_name="Interfaces")
     macs_synced       = tables.Column(verbose_name="MACs")
+    actions           = columns.ActionsColumn(actions=())
 
     class Meta(NetBoxTable.Meta):
         model = SyncLog
@@ -32,11 +33,12 @@ class SNMPCredentialTable(NetBoxTable):
     version  = columns.ChoiceFieldColumn()
     community = tables.Column()
     username  = tables.Column()
+    actions   = columns.ActionsColumn(actions=("edit", "delete"))
 
     class Meta(NetBoxTable.Meta):
         model = SNMPCredential
-        fields = ("pk", "name", "priority", "version", "community", "username")
-        default_columns = ("name", "priority", "version", "community", "username")
+        fields = ("pk", "name", "priority", "version", "community", "username", "actions")
+        default_columns = ("name", "priority", "version", "community", "username", "actions")
 
 
 class LearnedMACTable(NetBoxTable):
@@ -60,6 +62,8 @@ class LearnedMACTable(NetBoxTable):
         verbose_name="",
         orderable=False,
     )
+
+    actions = columns.ActionsColumn(actions=())
 
     class Meta(NetBoxTable.Meta):
         model = LearnedMAC
