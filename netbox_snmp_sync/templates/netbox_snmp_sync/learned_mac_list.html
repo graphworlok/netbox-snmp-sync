@@ -13,3 +13,70 @@
   </button>
 </form>
 {% endblock %}
+
+{% block content %}
+{{ block.super }}
+
+<div class="row mt-4">
+  <div class="col col-md-4">
+    <div class="card">
+      <h5 class="card-header"><i class="mdi mdi-information-outline"></i> What are Learned MACs?</h5>
+      <div class="card-body text-muted small">
+        <p>During each SNMP sync, the engine reads the <strong>bridge forwarding table</strong>
+        (dot1dTpFdbTable / Q-BRIDGE) from every managed switch.
+        Each entry records a MAC address that the switch has seen arrive on a particular port.</p>
+        <p>These entries are stored here so you can track what end-devices are connected to your
+        network without requiring agents or NetBox devices for every endpoint.</p>
+        <p>Only <strong>Learned</strong>-type entries are kept — the switch's own MAC addresses
+        (Self / Mgmt) are filtered out.</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="col col-md-4">
+    <div class="card">
+      <h5 class="card-header"><i class="mdi mdi-tag-multiple-outline"></i> Status Values</h5>
+      <div class="card-body small">
+        <table class="table table-sm mb-0">
+          <tbody>
+            <tr>
+              <td><span class="badge bg-blue">New</span></td>
+              <td class="text-muted">First time this MAC has been seen — not yet confirmed active.</td>
+            </tr>
+            <tr>
+              <td><span class="badge bg-success">Active</span></td>
+              <td class="text-muted">Seen in the most recent sync run.</td>
+            </tr>
+            <tr>
+              <td><span class="badge bg-secondary">Stale</span></td>
+              <td class="text-muted">Present in a previous sync but absent from recent runs.
+              Use <em>Mark Stale</em> to bulk-flag entries not seen in 48 hours.</td>
+            </tr>
+            <tr>
+              <td><span class="badge bg-purple">Promoted</span></td>
+              <td class="text-muted">Manually converted into a full NetBox device record via the
+              <em>Promote</em> action.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="col col-md-4">
+    <div class="card">
+      <h5 class="card-header"><i class="mdi mdi-arrow-up-circle-outline"></i> Promoting a MAC</h5>
+      <div class="card-body text-muted small">
+        <p>If a MAC address belongs to a device you want to manage in NetBox, click the
+        <strong>Promote</strong> button (<i class="mdi mdi-arrow-up-circle text-success"></i>)
+        in the list or on the detail page.</p>
+        <p>This creates a new NetBox <strong>Device</strong> record, assigns it a site, role,
+        and device type, and links the MAC address to its interface. The Learned MAC entry is
+        then marked <em>Promoted</em> and won't be promoted again.</p>
+        <p>Only <em>Active</em> or <em>New</em> entries with a known source interface are
+        eligible for promotion.</p>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

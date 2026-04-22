@@ -52,6 +52,34 @@
       </div>
     </div>
 
+    <div class="card mt-3">
+      <h5 class="card-header"><i class="mdi mdi-information-outline"></i> About This Entry</h5>
+      <div class="card-body text-muted small">
+        <p><strong>Source device / interface</strong> — the switch that reported this MAC
+        and the port it arrived on. The switch's bridge forwarding table maps each learned
+        MAC to the port where the frame was received.</p>
+        <p><strong>Entry Type</strong> reflects how the switch classified this MAC in its
+        forwarding table:
+          <span class="badge bg-success">Learned</span> means it was dynamically learned
+          from traffic;
+          <span class="badge bg-secondary">Other</span> covers static, management, or
+          unknown classifications.
+          Only <em>Learned</em> entries are stored here — the switch's own addresses are
+          filtered out.
+        </p>
+        {% if object.is_promotable %}
+        <p class="mb-0 text-body">This entry is <strong>eligible for promotion</strong> —
+        it has a known source interface and is either Active or New.</p>
+        {% elif object.status == "promoted" %}
+        <p class="mb-0">This MAC was already promoted to NetBox device
+        ID <strong>{{ object.promoted_to_device_id }}</strong> on {{ object.promoted_at }}.</p>
+        {% else %}
+        <p class="mb-0">This entry is not currently eligible for promotion (status must be
+        Active or New and a source interface must be known).</p>
+        {% endif %}
+      </div>
+    </div>
+
     {% if object.is_promotable %}
     <div class="card mt-3">
       <h5 class="card-header">Actions</h5>

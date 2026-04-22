@@ -51,6 +51,32 @@
 
   <div class="col col-md-5">
     <div class="card">
+      <h5 class="card-header"><i class="mdi mdi-information-outline"></i> Field Explanations</h5>
+      <div class="card-body text-muted small">
+        <dl class="mb-0">
+          <dt>Seed IPs</dt>
+          <dd>The starting points for SNMP discovery. The engine contacts each seed IP,
+          collects device information, then follows CDP/LLDP neighbour links outward up
+          to <em>Max Discovery Depth</em> hops. Add at least one core switch or router.</dd>
+
+          <dt>Max Discovery Depth</dt>
+          <dd>How many neighbour-link hops to follow from each seed. Depth 0 = seed devices
+          only. Depth 1 = seeds + their immediate neighbours. Higher values cover more of
+          the network but increase runtime proportionally.</dd>
+
+          <dt>Max Workers</dt>
+          <dd>Number of devices polled concurrently. Increase this to speed up large syncs.
+          Keep it below your switch SNMP rate-limit threshold — most access switches handle
+          10–20 concurrent requests without issue.</dd>
+
+          <dt>Cron Expression</dt>
+          <dd>Reference value only — NetBox does not execute cron jobs. Copy this into
+          a server cron entry or systemd timer to schedule automatic runs.</dd>
+        </dl>
+      </div>
+    </div>
+
+    <div class="card mt-3">
       <h5 class="card-header">External Scheduler Setup</h5>
       <div class="card-body text-muted small">
         <p>NetBox does not run background jobs directly. Use <strong>cron</strong> or a

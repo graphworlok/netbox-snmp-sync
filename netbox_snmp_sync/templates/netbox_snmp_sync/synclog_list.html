@@ -8,3 +8,65 @@
   <i class="mdi mdi-information-outline"></i> Run via CLI
 </a>
 {% endblock %}
+
+{% block content %}
+{{ block.super }}
+
+<div class="row mt-4">
+  <div class="col col-md-4">
+    <div class="card">
+      <h5 class="card-header"><i class="mdi mdi-history"></i> What are Sync Logs?</h5>
+      <div class="card-body text-muted small">
+        <p>Each time the SNMP sync engine runs, a log entry is created here to record the
+        outcome. Logs capture the start and end time, how many devices were discovered,
+        and whether any errors were encountered.</p>
+        <p>Sync runs are triggered manually from the command line:</p>
+        <pre class="bg-light p-2 rounded mb-0">python manage.py sync_snmp</pre>
+      </div>
+    </div>
+  </div>
+
+  <div class="col col-md-4">
+    <div class="card">
+      <h5 class="card-header"><i class="mdi mdi-tag-multiple-outline"></i> Status Values</h5>
+      <div class="card-body small">
+        <table class="table table-sm mb-0">
+          <tbody>
+            <tr>
+              <td><span class="badge bg-success">Success</span></td>
+              <td class="text-muted">All devices synced with no errors.</td>
+            </tr>
+            <tr>
+              <td><span class="badge bg-danger">Failed</span></td>
+              <td class="text-muted">One or more devices raised an error, or the run was terminated by an unhandled exception.</td>
+            </tr>
+            <tr>
+              <td><span class="badge bg-warning text-dark">Running</span></td>
+              <td class="text-muted">Sync started but never recorded a completion — the process was likely interrupted or killed.</td>
+            </tr>
+            <tr>
+              <td><span class="badge bg-secondary">Pending</span></td>
+              <td class="text-muted">Queued but never started.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="col col-md-4">
+    <div class="card">
+      <h5 class="card-header"><i class="mdi mdi-cog-outline"></i> Scheduling Syncs</h5>
+      <div class="card-body text-muted small">
+        <p>The sync engine does not have a built-in scheduler. To run syncs automatically,
+        add a cron job or systemd timer on the NetBox server:</p>
+        <pre class="bg-light p-2 rounded mb-1">0 * * * * netbox \
+  python /opt/netbox/netbox/manage.py \
+  sync_snmp</pre>
+        <p class="mb-0">Use <code>--dry-run</code> to test without writing changes, or
+        <code>--seed IP</code> to override the seed IPs from the Schedule page.</p>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
