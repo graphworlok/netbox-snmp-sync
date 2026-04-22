@@ -556,13 +556,121 @@ def _backfill_iface_id(
 # Cable sync  (second pass — after all devices/interfaces exist in NetBox)
 # ---------------------------------------------------------------------------
 
+def _get_oui_lookup() -> OuiLookup:
+    """
+    Load OUI vendor data.
+
+    Tries config.OUI_FILE first (set from PLUGINS_CONFIG['netbox_snmp_sync']['oui_file']).
+    If no data loads there, falls back to local_path values stored in the OUIDatabase
+    Django model (populated by the OUI download page).
+    """
+    oui = OuiLookup.from_config()
+    if not oui.loaded:
+        try:
+            from netbox_snmp_sync.models import OUIDatabase
+            paths = [
+                r.local_path
+                for r in OUIDatabase.objects.exclude(local_path="")
+                if r.local_path
+            ]
+            if paths:
+                old_file = config.OUI_FILE
+                config.OUI_FILE = paths
+                oui = OuiLookup.from_config()
+                config.OUI_FILE = old_file
+                if oui.loaded:
+                    log.info(
+                        "OUI data loaded from OUIDatabase model (%d path(s)): %s",
+                        len(paths), ", ".join(paths),
+                    )
+        except Exception as exc:
+            log.debug("OUI fallback from OUIDatabase failed: %s", exc)
+    if not oui.loaded:
+        log.warning(
+            "No OUI data loaded — vendor field will be empty. "
+            "Download OUI files via Plugins → OUI Databases, or set "
+            "oui_file in PLUGINS_CONFIG['netbox_snmp_sync']."
+        )
+    return oui
+
+
+def _set_ephemeral_device_id(mac: str, source_device_ip: str, device_id: int) -> None:
+    """Store the NetBox ephemeral endpoint device ID on the LearnedMAC record."""
+    try:
+        from netbox_snmp_sync.models import LearnedMAC
+        LearnedMAC.objects.filter(
+            mac_address=mac,
+            source_device_ip=source_device_ip,
+        ).update(ephemeral_device_id=device_id)
+    except Exception as exc:
+        log.debug("Could not set ephemeral_device_id for %s: %s", mac, exc)
+
+
+def _upsert_learned_macs(
+    device: DeviceInfo,
+    if_name: str,
+    macs: set[str],
+    vendor_map: dict[str, str],
+    entry_map: dict,
+) -> None:
+    """
+    Create or update LearnedMAC Django model records for each MAC observed
+    on an access port (non-trunk, non-port-channel) during this sync run.
+
+    Status transitions:
+      - First time seen  → NEW   (model default)
+      - Seen again       → ACTIVE
+      - Already PROMOTED → status unchanged (promotion is permanent)
+    """
+    try:
+        from netbox_snmp_sync.models import LearnedMAC
+        from netbox_snmp_sync.choices import LearnedMACStatusChoices
+    except ImportError as exc:
+        log.error("Could not import LearnedMAC model: %s", exc)
+        return
+
+    from django.utils import timezone as tz
+
+    now = tz.now()
+    for mac in macs:
+        raw_entry = entry_map.get(mac)
+        entry_type_val = raw_entry.entry_type.value if raw_entry else "learned"
+        vlan_val       = raw_entry.vlan if raw_entry else 0
+
+        try:
+            obj, created = LearnedMAC.objects.update_or_create(
+                mac_address=mac,
+                source_device_ip=device.query_ip,
+                defaults={
+                    "vendor":             vendor_map.get(mac, ""),
+                    "source_device_name": device.display_name or "",
+                    "source_interface":   if_name,
+                    "vlan":               vlan_val or 0,
+                    "entry_type":         entry_type_val,
+                    "last_seen":          now,
+                },
+            )
+            # On subsequent syncs promote status from NEW → ACTIVE;
+            # never downgrade a PROMOTED entry.
+            if not created and obj.status != LearnedMACStatusChoices.PROMOTED:
+                LearnedMAC.objects.filter(pk=obj.pk).update(
+                    status=LearnedMACStatusChoices.ACTIVE
+                )
+        except Exception as exc:
+            log.error(
+                "LearnedMAC upsert failed for %s on %s/%s: %s",
+                mac, device.display_name, if_name, exc,
+            )
+
+
 def sync_mac_table(
     devices: list[DeviceInfo],
     nb: NetBoxClient,
     dry_run: bool = False,
 ) -> dict[str, int]:
     """
-    Sync per-interface bridge forwarding table MACs into NetBox.
+    Sync per-interface bridge forwarding table MACs into NetBox and into
+    the plugin's local LearnedMAC table.
 
     MACs are stored in the 'learned_macs' JSON custom field on each
     interface — NOT as dcim.mac_addresses objects (those represent the
@@ -583,7 +691,7 @@ def sync_mac_table(
     """
     nb.ensure_mac_address_fields()
     nb.ensure_ephemeral_endpoint_type()
-    oui = OuiLookup.from_config()
+    oui = _get_oui_lookup()
 
     totals: dict[str, int] = {"updated": 0, "unchanged": 0, "skipped": 0}
 
@@ -597,15 +705,19 @@ def sync_mac_table(
             for variant in _iface_name_variants(nbr.local_if_name):
                 neighbour_ifaces.add(variant)
 
-        # Group MACs by interface name first
+        # Group MACs by interface name; also keep one MacTableEntry per MAC
+        # for vlan + entry_type metadata written to the LearnedMAC model.
         by_iface: dict[str, set[str]] = {}
         vendor_map: dict[str, str] = {}
+        entry_map: dict[str, object] = {}   # mac → MacTableEntry
         for entry in device.mac_table:
             if not entry.if_name:
                 continue
             by_iface.setdefault(entry.if_name, set()).add(entry.mac_address)
             if entry.mac_address not in vendor_map:
                 vendor_map[entry.mac_address] = oui.lookup(entry.mac_address)
+            if entry.mac_address not in entry_map:
+                entry_map[entry.mac_address] = entry
 
         # Build a map of interface name → NetBox device for this device/stack
         iface_device_map = _resolve_iface_devices(device, nb)
@@ -642,7 +754,7 @@ def sync_mac_table(
                 totals["skipped"] += len(macs)
                 if not dry_run:
                     try:
-                        nb.sync_interface_mac_table(nb_iface, if_name, set(), {}, {})
+                        nb.sync_interface_mac_table(nb_iface, if_name, set(), {})
                     except Exception:
                         pass
                     nb.set_interface_uncontrolled_tag(nb_iface, add=False)
@@ -663,7 +775,7 @@ def sync_mac_table(
                 totals["skipped"] += len(macs)
                 if not dry_run:
                     try:
-                        nb.sync_interface_mac_table(nb_iface, if_name, set(), {}, {})
+                        nb.sync_interface_mac_table(nb_iface, if_name, set(), {})
                     except Exception:
                         pass
                     nb.set_interface_uncontrolled_tag(nb_iface, add=False)
@@ -698,6 +810,10 @@ def sync_mac_table(
                 log.error("MAC table sync failed %s/%s: %s", device.display_name, if_name, exc)
                 totals["skipped"] += 1
 
+            # Write to the plugin's local LearnedMAC table (independent of
+            # the NetBox API — succeeds even if the API call above failed).
+            _upsert_learned_macs(device, if_name, macs, vendor_map, entry_map)
+
             nb.set_interface_uncontrolled_tag(nb_iface, add=unmanaged_multimac)
 
             # Create / update Ephemeral Endpoint device records for each learned MAC.
@@ -707,10 +823,12 @@ def sync_mac_table(
             if not unmanaged_multimac:
                 # Single endpoint — cable straight to the switch port
                 mac = next(iter(macs))
-                nb.get_or_create_ephemeral_endpoint(
+                ep_dev = nb.get_or_create_ephemeral_endpoint(
                     mac, switch_site_id,
                     upstream_iface_id=nb_iface.id,
                 )
+                if ep_dev:
+                    _set_ephemeral_device_id(mac, device.query_ip, ep_dev.id)
             else:
                 # Multiple endpoints — route through an Unmanaged Switch device
                 usw_name = f"usw:{device.display_name}/{if_name}"
@@ -719,10 +837,12 @@ def sync_mac_table(
                 )
                 for mac in macs:
                     upstream = mac_port_map.get(mac.lower())
-                    nb.get_or_create_ephemeral_endpoint(
+                    ep_dev = nb.get_or_create_ephemeral_endpoint(
                         mac, switch_site_id,
                         upstream_iface_id=upstream,
                     )
+                    if ep_dev:
+                        _set_ephemeral_device_id(mac, device.query_ip, ep_dev.id)
 
     return totals
 

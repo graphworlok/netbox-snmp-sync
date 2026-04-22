@@ -37,7 +37,11 @@ class LearnedMAC(models.Model):
     first_seen = models.DateTimeField(auto_now_add=True, db_index=True)
     last_seen  = models.DateTimeField(default=timezone.now, db_index=True)
 
-    # Set when promoted to a NetBox device
+    # NetBox device ID of the auto-created Ephemeral Endpoint device for this MAC.
+    # Set by sync_mac_table after get_or_create_ephemeral_endpoint succeeds.
+    ephemeral_device_id = models.PositiveIntegerField(null=True, blank=True)
+
+    # Set when promoted to a full managed NetBox device
     promoted_to_device_id = models.PositiveIntegerField(null=True, blank=True)
     promoted_at           = models.DateTimeField(null=True, blank=True)
 

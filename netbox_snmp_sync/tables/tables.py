@@ -51,6 +51,17 @@ class LearnedMACTable(NetBoxTable):
     status             = columns.ChoiceFieldColumn(verbose_name="Status")
     last_seen          = tables.DateTimeColumn(verbose_name="Last Seen")
     first_seen         = tables.DateTimeColumn(verbose_name="First Seen")
+    ephemeral_device   = tables.TemplateColumn(
+        template_code=(
+            "{% if record.ephemeral_device_id %}"
+            "<a href=\"/dcim/devices/{{ record.ephemeral_device_id }}/\" "
+            "title=\"View ephemeral endpoint in NetBox\">"
+            "<i class=\"mdi mdi-server-network\"></i></a>"
+            "{% endif %}"
+        ),
+        verbose_name="Endpoint",
+        orderable=False,
+    )
     promote            = tables.TemplateColumn(
         template_code=(
             "{% if record.is_promotable %}"
@@ -69,9 +80,10 @@ class LearnedMACTable(NetBoxTable):
         model = LearnedMAC
         fields = (
             "pk", "mac_address", "vendor", "source_device_name", "source_interface",
-            "vlan", "entry_type", "status", "last_seen", "first_seen", "promote",
+            "vlan", "entry_type", "status", "last_seen", "first_seen",
+            "ephemeral_device", "promote",
         )
         default_columns = (
             "mac_address", "vendor", "source_device_name", "source_interface",
-            "vlan", "status", "last_seen", "promote",
+            "vlan", "status", "last_seen", "ephemeral_device", "promote",
         )

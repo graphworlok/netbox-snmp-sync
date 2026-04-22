@@ -23,6 +23,16 @@
           <tr><th scope="row">VLAN</th><td>{% if object.vlan %}{{ object.vlan }}{% else %}—{% endif %}</td></tr>
           <tr><th scope="row">First Seen</th><td>{{ object.first_seen }}</td></tr>
           <tr><th scope="row">Last Seen</th><td>{{ object.last_seen }}</td></tr>
+          {% if object.ephemeral_device_id %}
+          <tr>
+            <th scope="row">Ephemeral Endpoint</th>
+            <td>
+              <a href="/dcim/devices/{{ object.ephemeral_device_id }}/">
+                <i class="mdi mdi-server-network"></i> Device #{{ object.ephemeral_device_id }}
+              </a>
+            </td>
+          </tr>
+          {% endif %}
         </table>
       </div>
     </div>
