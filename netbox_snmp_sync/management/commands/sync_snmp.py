@@ -180,8 +180,27 @@ class Command(BaseCommand):
             sync_log.interfaces_synced = objects_written
             sync_log.macs_synced       = macs_total
             sync_log.completed_at      = datetime.now(tz=timezone.utc)
+
+            # Build a human-readable summary stored in the message field so the
+            # UI can explain how the status was determined.
+            summary_lines = [
+                f"Discovered {len(devices)} device(s) from {len(seed_ips)} seed IP(s).",
+                f"Objects written to NetBox: {objects_written}.",
+                f"MACs synced: {macs_total}.",
+            ]
+            if dry_run:
+                summary_lines.append("Dry-run mode — no changes were written to NetBox.")
             if errors:
-                sync_log.message = "\n".join(errors[:10])  # cap at 10 error lines
+                summary_lines.append(
+                    f"\nStatus set to FAILED because {len(errors)} error(s) occurred during sync:"
+                )
+                summary_lines.extend(f"  • {e}" for e in errors[:20])
+                if len(errors) > 20:
+                    summary_lines.append(f"  … and {len(errors) - 20} more (check server logs).")
+            else:
+                summary_lines.append("\nStatus set to SUCCESS — all devices synced without errors.")
+
+            sync_log.message = "\n".join(summary_lines)
             sync_log.save()
 
             if errors:
@@ -192,7 +211,11 @@ class Command(BaseCommand):
         except Exception as exc:
             sync_log.status       = SyncStatusChoices.FAILED
             sync_log.completed_at = datetime.now(tz=timezone.utc)
-            sync_log.message      = traceback.format_exc()
+            sync_log.message      = (
+                f"Status set to FAILED — an unhandled exception terminated the sync:\n"
+                f"  {type(exc).__name__}: {exc}\n\n"
+                f"Full traceback:\n{traceback.format_exc()}"
+            )
             sync_log.save()
             self.stderr.write(self.style.ERROR(f"Sync failed: {exc}"))
             raise

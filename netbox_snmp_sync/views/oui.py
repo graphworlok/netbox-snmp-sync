@@ -61,10 +61,36 @@ class OUIDownloadView(View):
         try:
             log.info("Downloading OUI %s from %s → %s", registry, url, dest)
             urllib.request.urlretrieve(url, dest)
-        except (urllib.error.URLError, OSError) as exc:
-            db_row.last_error = str(exc)
+        except urllib.error.HTTPError as exc:
+            error_msg = (
+                f"HTTP {exc.code} {exc.msg} — server refused the request.\n"
+                f"URL: {url}\n"
+                f"Try manually:  wget -O {dest} \"{url}\""
+            )
+            db_row.last_error = error_msg
             db_row.save(update_fields=["last_error"])
-            messages.error(request, f"Download failed: {exc}")
+            messages.error(request, f"Download failed: HTTP {exc.code} {exc.msg} — see error details below.")
+            return redirect("plugins:netbox_snmp_sync:oui_list")
+        except urllib.error.URLError as exc:
+            reason = exc.reason if hasattr(exc, "reason") else str(exc)
+            error_msg = (
+                f"Connection error: {reason}\n"
+                f"URL: {url}\n"
+                f"Try manually:  wget -O {dest} \"{url}\""
+            )
+            db_row.last_error = error_msg
+            db_row.save(update_fields=["last_error"])
+            messages.error(request, f"Download failed: {reason} — see error details below.")
+            return redirect("plugins:netbox_snmp_sync:oui_list")
+        except OSError as exc:
+            error_msg = (
+                f"File system error: {exc}\n"
+                f"Destination: {dest}\n"
+                f"Try manually:  wget -O {dest} \"{url}\""
+            )
+            db_row.last_error = error_msg
+            db_row.save(update_fields=["last_error"])
+            messages.error(request, f"Download failed: {exc} — see error details below.")
             return redirect("plugins:netbox_snmp_sync:oui_list")
 
         # Count entries

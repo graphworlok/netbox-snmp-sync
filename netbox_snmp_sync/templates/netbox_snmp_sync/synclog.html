@@ -24,10 +24,25 @@
       </div>
     </div>
 
+    {% if object.status == "running" %}
+    <div class="alert alert-warning mt-3">
+      <i class="mdi mdi-alert-outline"></i>
+      <strong>Still marked Running.</strong>
+      The sync process started but never recorded a completion.
+      This usually means the process was killed or the server restarted mid-run.
+      No completion status could be determined — check server logs for details.
+    </div>
+    {% endif %}
+
     {% if object.message %}
     <div class="card mt-3">
-      <h5 class="card-header">Message / Error</h5>
-      <div class="card-body"><pre class="mb-0 text-danger">{{ object.message }}</pre></div>
+      <h5 class="card-header d-flex align-items-center gap-2">
+        Sync Summary
+        <span class="badge bg-{{ object.get_status_color }} ms-1">{{ object.get_status_display }}</span>
+      </h5>
+      <div class="card-body">
+        <pre class="mb-0 small {% if object.status == 'failed' %}text-danger{% else %}text-body{% endif %}">{{ object.message }}</pre>
+      </div>
     </div>
     {% endif %}
   </div>
@@ -49,6 +64,18 @@
           <tr><th scope="row">Interfaces synced</th><td>{{ object.interfaces_synced }}</td></tr>
           <tr><th scope="row">MAC addresses synced</th><td>{{ object.macs_synced }}</td></tr>
         </table>
+      </div>
+    </div>
+
+    <div class="card mt-3">
+      <h5 class="card-header">Status Determination</h5>
+      <div class="card-body text-muted small">
+        <ul class="mb-0">
+          <li><span class="badge bg-success">Success</span> — discovery and all per-device syncs completed with no exceptions.</li>
+          <li><span class="badge bg-danger">Failed</span> — one or more devices raised an exception during sync, or an unhandled error terminated the run early. See Sync Summary for details.</li>
+          <li><span class="badge bg-warning text-dark">Running</span> — sync started but no completion was recorded. The process was likely interrupted.</li>
+          <li><span class="badge bg-secondary">Pending</span> — sync was queued but never started.</li>
+        </ul>
       </div>
     </div>
   </div>

@@ -13,7 +13,8 @@
           <thead>
             <tr>
               <th>Registry</th>
-              <th>File Path</th>
+              <th>Source URL</th>
+              <th>Local File</th>
               <th>Entries</th>
               <th>Size</th>
               <th>Last Downloaded</th>
@@ -24,6 +25,7 @@
             {% for db in databases %}
             <tr>
               <td><span class="badge bg-{{ db.get_registry_color }}">{{ db.registry }}</span></td>
+              <td><a href="{{ db.download_url }}" class="small" target="_blank" rel="noopener">{{ db.download_url }}</a></td>
               <td>
                 {% if db.local_path %}
                   <code class="small">{{ db.local_path }}</code>
@@ -36,7 +38,7 @@
               <td>{{ db.last_downloaded|default:"Never" }}</td>
               <td>
                 {% if db.last_error %}
-                  <span class="badge bg-danger" title="{{ db.last_error }}">Error</span>
+                  <span class="badge bg-danger">Error</span>
                 {% elif db.file_exists %}
                   <span class="badge bg-success">OK</span>
                 {% else %}
@@ -45,8 +47,11 @@
               </td>
             </tr>
             {% if db.last_error %}
-            <tr>
-              <td colspan="6"><pre class="text-danger mb-0 small">{{ db.last_error }}</pre></td>
+            <tr class="table-danger">
+              <td colspan="7">
+                <strong class="small">Download error:</strong>
+                <pre class="text-danger mb-0 mt-1 small">{{ db.last_error }}</pre>
+              </td>
             </tr>
             {% endif %}
             {% endfor %}
@@ -73,6 +78,19 @@
             <i class="mdi mdi-download"></i> Download
           </button>
         </form>
+      </div>
+    </div>
+
+    <div class="card mt-3">
+      <h5 class="card-header">Manual Console Download</h5>
+      <div class="card-body small">
+        <p class="text-muted">If the browser download fails, run these on the server
+        (adjust the destination path to match the Storage Path above):</p>
+        {% for db in databases %}
+        <p class="mb-1"><span class="badge bg-{{ db.get_registry_color }}">{{ db.registry }}</span></p>
+        <pre class="small bg-light p-2 rounded">wget -O /opt/netbox/oui/{{ db.registry|lower|cut:" " }}.csv \
+  "{{ db.download_url }}"</pre>
+        {% endfor %}
       </div>
     </div>
 
