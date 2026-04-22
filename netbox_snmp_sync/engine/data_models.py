@@ -96,6 +96,15 @@ class MacTableEntry:
 
 
 @dataclass
+class ArpEntry:
+    """A single row from the ARP table (ipNetToMediaTable, RFC 1213)."""
+    ip_address:  str       # e.g. "192.168.10.42"
+    mac_address: str       # colon-separated lowercase
+    if_index:    int       # ifIndex of the L3 interface (SVI) that owns this entry
+    if_name:     str = ""  # resolved interface name, e.g. "Vlan10"
+
+
+@dataclass
 class StackMember:
     """One physical member of a Cisco StackWise / Catalyst stacked chassis."""
     member_number: int      # 1-based stack position
@@ -193,6 +202,7 @@ class DeviceInfo:
     interfaces: list[Interface] = field(default_factory=list)
     neighbors: list[Neighbor] = field(default_factory=list)
     mac_table: list[MacTableEntry] = field(default_factory=list)
+    arp_table: list[ArpEntry]     = field(default_factory=list)
     site_id: Optional[int] = None  # override IPAM site resolution when set
     stack_members: list[StackMember] = field(default_factory=list)
     # Routing / BGP data — populated by SNMPCollector.collect_routing()

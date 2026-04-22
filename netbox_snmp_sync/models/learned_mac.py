@@ -37,6 +37,10 @@ class LearnedMAC(models.Model):
     first_seen = models.DateTimeField(auto_now_add=True, db_index=True)
     last_seen  = models.DateTimeField(default=timezone.now, db_index=True)
 
+    # IP address resolved from the switch's ARP table (ipNetToMediaTable).
+    # Populated during sync; None if the switch had no ARP entry for this MAC.
+    ip_address = models.GenericIPAddressField(null=True, blank=True, db_index=True)
+
     # NetBox device ID of the auto-created Ephemeral Endpoint device for this MAC.
     # Set by sync_mac_table after get_or_create_ephemeral_endpoint succeeds.
     ephemeral_device_id = models.PositiveIntegerField(null=True, blank=True)

@@ -43,6 +43,7 @@ class SNMPCredentialTable(NetBoxTable):
 
 class LearnedMACTable(NetBoxTable):
     mac_address        = tables.Column(linkify=True, verbose_name="MAC Address")
+    ip_address         = tables.Column(verbose_name="IP Address")
     vendor             = tables.Column(verbose_name="Vendor")
     source_device_name = tables.Column(verbose_name="Source Device")
     source_interface   = tables.Column(verbose_name="Interface")
@@ -79,11 +80,12 @@ class LearnedMACTable(NetBoxTable):
     class Meta(NetBoxTable.Meta):
         model = LearnedMAC
         fields = (
-            "pk", "mac_address", "vendor", "source_device_name", "source_interface",
-            "vlan", "entry_type", "status", "last_seen", "first_seen",
-            "ephemeral_device", "promote",
+            "pk", "mac_address", "ip_address", "vendor", "source_device_name",
+            "source_interface", "vlan", "entry_type", "status", "last_seen",
+            "first_seen", "ephemeral_device", "promote",
         )
         default_columns = (
-            "mac_address", "vendor", "source_device_name", "source_interface",
-            "vlan", "status", "last_seen", "ephemeral_device", "promote",
+            "mac_address", "ip_address", "vendor", "source_device_name",
+            "source_interface", "vlan", "status", "last_seen",
+            "ephemeral_device", "promote",
         )

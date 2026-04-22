@@ -612,10 +612,13 @@ def _upsert_learned_macs(
     macs: set[str],
     vendor_map: dict[str, str],
     entry_map: dict,
+    arp_map: dict[str, str],
 ) -> None:
     """
     Create or update LearnedMAC Django model records for each MAC observed
     on an access port (non-trunk, non-port-channel) during this sync run.
+
+    arp_map: mac_address → ip_address, built from the device's ARP table.
 
     Status transitions:
       - First time seen  → NEW   (model default)
@@ -647,6 +650,7 @@ def _upsert_learned_macs(
                     "source_interface":   if_name,
                     "vlan":               vlan_val or 0,
                     "entry_type":         entry_type_val,
+                    "ip_address":         arp_map.get(mac) or None,
                     "last_seen":          now,
                 },
             )
@@ -718,6 +722,14 @@ def sync_mac_table(
                 vendor_map[entry.mac_address] = oui.lookup(entry.mac_address)
             if entry.mac_address not in entry_map:
                 entry_map[entry.mac_address] = entry
+
+        # Build MAC → IP lookup from the device's ARP table.
+        # ARP entries are keyed on MAC so a single endpoint's IP can be found
+        # regardless of which VLAN/SVI interface holds the ARP binding.
+        arp_map: dict[str, str] = {}
+        for arp_entry in device.arp_table:
+            if arp_entry.mac_address and arp_entry.ip_address:
+                arp_map[arp_entry.mac_address] = arp_entry.ip_address
 
         # Build a map of interface name → NetBox device for this device/stack
         iface_device_map = _resolve_iface_devices(device, nb)
@@ -812,7 +824,7 @@ def sync_mac_table(
 
             # Write to the plugin's local LearnedMAC table (independent of
             # the NetBox API — succeeds even if the API call above failed).
-            _upsert_learned_macs(device, if_name, macs, vendor_map, entry_map)
+            _upsert_learned_macs(device, if_name, macs, vendor_map, entry_map, arp_map)
 
             nb.set_interface_uncontrolled_tag(nb_iface, add=unmanaged_multimac)
 

@@ -86,6 +86,7 @@ _TRANSPORT_ASYNC: bool = (
 
 from .data_models import (
     AdminStatus,
+    ArpEntry,
     BgpPeer,
     BgpPeerState,
     DeviceInfo,
@@ -155,6 +156,11 @@ OID_BP_IF_INDEX = "1.3.6.1.2.1.17.1.4.1.2"
 # Index: <vlan>.<mac-as-6-octet-oid>
 OID_QFDB_PORT   = "1.3.6.1.2.1.17.7.1.2.2.1.2"
 OID_QFDB_STATUS = "1.3.6.1.2.1.17.7.1.2.2.1.3"
+
+# IP-MIB ipNetToMediaTable — ARP cache (IPv4, RFC 1213)
+# Index: <ifIndex>.<a>.<b>.<c>.<d>  (IP encoded as 4 OID components)
+OID_ARP_MAC  = "1.3.6.1.2.1.4.22.1.2"  # ipNetToMediaPhysAddress (OctetString)
+OID_ARP_TYPE = "1.3.6.1.2.1.4.22.1.4"  # ipNetToMediaType: 1=other 2=invalid 3=dynamic 4=static
 
 # CISCO-CDP-MIB
 OID_CDP_CACHE_DEVICE_ID   = "1.3.6.1.4.1.9.9.23.1.2.1.1.6"
@@ -559,6 +565,7 @@ class SNMPCollector:
             info.neighbors += self._collect_cdp(interfaces)
 
         info.mac_table = self._collect_mac_table(interfaces)
+        info.arp_table = self._collect_arp(interfaces)
 
         return info
 
@@ -759,6 +766,58 @@ class SNMPCollector:
                 interfaces[if_idx].ip_addresses.append(ip_obj)
 
     # ------------------------------------------------------------------
+    # ARP table  (ipNetToMediaTable)
+    # ------------------------------------------------------------------
+
+    def _collect_arp(self, interfaces: dict[int, Interface]) -> list[ArpEntry]:
+        """
+        Walk ipNetToMediaTable to build an ARP cache (IP → MAC mappings).
+
+        OID index format: <ifIndex>.<a>.<b>.<c>.<d>
+        where a.b.c.d is the neighbour IP address encoded as four decimal OID
+        components.  The value of ipNetToMediaPhysAddress is an OctetString MAC.
+
+        Type 2 (invalid/incomplete) entries are skipped; dynamic (3) and
+        static (4) entries are retained.
+
+        Each entry's if_name is the L3 interface that owns the ARP binding,
+        typically an SVI (e.g. 'Vlan10'), which correlates with the VLAN IDs
+        in the bridge forwarding table.
+        """
+        if_names = {idx: iface.name for idx, iface in interfaces.items()}
+
+        mac_rows = self._walk(OID_ARP_MAC)
+        type_rows = self._walk(OID_ARP_TYPE)
+
+        entries: list[ArpEntry] = []
+        for key, raw_mac in mac_rows.items():
+            # Skip invalid/incomplete entries
+            if type_rows.get(key, "3") == "2":
+                continue
+
+            parts = key.split(".")
+            if len(parts) < 5:
+                continue
+            try:
+                if_idx = int(parts[0])
+                ip     = ".".join(parts[1:5])
+            except (ValueError, IndexError):
+                continue
+
+            mac = _format_mac(raw_mac)
+            if not mac:
+                continue
+
+            entries.append(ArpEntry(
+                ip_address=ip,
+                mac_address=mac,
+                if_index=if_idx,
+                if_name=if_names.get(if_idx, ""),
+            ))
+
+        log.debug("ARP table: %s  %d entries", self.host, len(entries))
+        return entries
+
     # MAC address table  (bridge forwarding table)
     # ------------------------------------------------------------------
 
